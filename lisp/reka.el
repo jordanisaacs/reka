@@ -183,7 +183,7 @@
                                   (= 0 (length (this-single-command-keys))) ;; no unfinished command sequence
                                   (= 0 (minibuffer-depth)) ;; no minibuffer editing active
                                   (= 0 (recursion-depth))))) ;; no recursive edit ongoing
-      (unless (equal win reka--last-focused)
+      (unless (equal buf reka--last-focused)
         (setq reka--last-focused buf)
         (reka-set-focus-request reka-handle
                                 (when can-focus-window
