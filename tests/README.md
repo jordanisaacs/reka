@@ -45,3 +45,16 @@ The virtual-pointer helper additionally refuses runtime paths outside the
 requests exercise the compositor protocol, rather than replacing native calls
 with Lisp or Rust stubs. A passing unit suite alone does not establish that
 these interaction paths work.
+
+`integration_focus.py` uses the same private compositor and real GTK clients.
+It checks that left/right clicks select the native application, physical
+keyboard input follows the clicked window, and button press/release and key
+events arrive once. Hovering preserves focus. Cases cover separate clients,
+a floating dialog and its parent in the same client, and an existing duplicate
+application buffer in a spare PGTK frame. Only the fixture's duplicate-layout
+setup temporarily bypasses Lisp's normal move-buffer advice; native placement,
+pointer events and keyboard delivery remain real. The spare-frame case checks
+that native output ownership determines the selected Emacs frame as well as
+the application receiving keyboard input.
+
+Run it through `nix build .#checks.x86_64-linux.native-focus`.

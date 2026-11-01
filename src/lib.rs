@@ -199,7 +199,7 @@ enum ToEmacs {
     WindowClosed(RiverWindowV1),
     ParentChanged(RiverWindowV1, Option<RiverWindowV1>),
     FrameFocused(String),
-    Focused(RiverWindowV1),
+    Focused(RiverWindowV1, String),
     TitleChange(RiverWindowV1, String),
     AppIDChange(RiverWindowV1, String),
     IdentifierChange(RiverWindowV1, String),
@@ -231,7 +231,9 @@ impl<'e> IntoLisp<'e> for ToEmacs {
             ToEmacs::FrameFocused(name) => env.cons(frame_focused, name),
             ToEmacs::WindowClosed(win) => env.call(cons, (window_closed, RefCell::new(win))),
             ToEmacs::MinimizeRequested(win) => env.cons(minimize_requested, RefCell::new(win)),
-            ToEmacs::Focused(win) => env.call(cons, (focused, RefCell::new(win))),
+            ToEmacs::Focused(win, frame_name) => {
+                env.call(list, (focused, RefCell::new(win), frame_name))
+            }
             ToEmacs::AppIDChange(win, app_id) => {
                 env.call(list, (app_id_change, RefCell::new(win), app_id))
             }
@@ -1589,8 +1591,10 @@ impl Reka {
             self.outputs[output].ls_output.set_default();
 
             // don't notify emacs about focused frames
-            if target != frame {
-                self.send(ToEmacs::Focused(target.clone()));
+            if target != frame
+                && let Some(name) = self.frames[frame].name.clone()
+            {
+                self.send(ToEmacs::Focused(target.clone(), name));
             }
         }
     }

@@ -45,6 +45,11 @@ hidden until an output is available again, then reused. Native focus requests
 wait for the selected frame to be displayed, preserving its application focus
 across the interruption.
 
+Clicking a tiled or floating application focuses it; moving the pointer over
+another window leaves keyboard focus unchanged. A click also selects the
+application's Emacs tile on the compositor's actual output, even when a spare
+PGTK frame retains another view of the same buffer.
+
 If you want something more fully featured, look in the direction of EWM instead!
 
 ## Floating windows

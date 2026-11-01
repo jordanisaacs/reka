@@ -33,6 +33,9 @@ static gboolean key(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 }
 
 static gboolean press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    printf("{\"kind\":\"button\",\"role\":\"%s\",\"button\":%u,\"pressed\":true,\"event_type\":%u}\n",
+           (char *)data, event->button, event->type);
+    fflush(stdout);
     if (gesture == 1) {
         gtk_window_begin_move_drag(GTK_WINDOW(widget), event->button,
                                    event->x_root, event->y_root, event->time);
@@ -44,7 +47,14 @@ static gboolean press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
            (char *)data, gesture);
     fflush(stdout);
     gesture = 0;
-    return FALSE;
+    return TRUE;
+}
+
+static gboolean release(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    printf("{\"kind\":\"button\",\"role\":\"%s\",\"button\":%u,\"pressed\":false,\"event_type\":%u}\n",
+           (char *)data, event->button, event->type);
+    fflush(stdout);
+    return TRUE;
 }
 
 static void destroyed(GtkWidget *widget, gpointer data) {
@@ -68,11 +78,12 @@ static GtkWidget *window(const char *role, GtkWidget *transient) {
         gtk_window_set_geometry_hints(GTK_WINDOW(widget), NULL, &hints,
                                      GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE);
     }
-    gtk_widget_add_events(widget, GDK_BUTTON_PRESS_MASK | GDK_KEY_PRESS_MASK);
+    gtk_widget_add_events(widget, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_KEY_PRESS_MASK);
     g_signal_connect(widget, "draw", G_CALLBACK(draw), (gpointer)role);
     g_signal_connect(widget, "configure-event", G_CALLBACK(configure), (gpointer)role);
     g_signal_connect(widget, "key-press-event", G_CALLBACK(key), (gpointer)role);
     g_signal_connect(widget, "button-press-event", G_CALLBACK(press), (gpointer)role);
+    g_signal_connect(widget, "button-release-event", G_CALLBACK(release), (gpointer)role);
     g_signal_connect(widget, "destroy", G_CALLBACK(destroyed), (gpointer)role);
     gtk_widget_show_all(widget);
     return widget;

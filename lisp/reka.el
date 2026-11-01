@@ -170,19 +170,20 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
              (setq reka--focused-floating-buffer nil
 		   reka--floating-keymap-active nil))))
 
-        (`(focused . ,window)
-         (when-let* ((buf (reka--find-buffer-for-window window)))
+        (`(focused ,window ,frame-name)
+         (when-let* ((buf (reka--find-buffer-for-window window))
+                     (frame (reka--frame-by-name frame-name)))
+           ;; Native output ownership is authoritative. PGTK can keep the same
+           ;; buffer in a spare frame; scanning every frame can select that
+           ;; invisible copy after a click on the real displayed application.
+           (select-frame frame 'norecord)
            (if (buffer-local-value 'reka-floating buf)
                (progn
-                 (when-let* ((frame (reka--frame-by-name
-                                     (buffer-local-value 'reka-floating-frame-name buf))))
-                   ;; Select the logical frame without requesting compositor focus.
-                   (select-frame frame 'norecord))
                  (setq reka--focused-floating-buffer buf)
                  (reka--remember-floating-selection))
              (setq reka--focused-floating-buffer nil
 		   reka--floating-keymap-active nil)
-             (when-let* ((win (get-buffer-window buf t)))
+             (when-let* ((win (get-buffer-window buf frame)))
                (select-window win 'norecord)))))
 
         (`(app-id-change ,window ,app-id)

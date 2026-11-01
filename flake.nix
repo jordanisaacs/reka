@@ -62,6 +62,7 @@
         reka = rekaFor system;
         native-keyboard = nativeCheck system "keyboard";
         native-floating = nativeCheck system "floating";
+        native-focus = nativeCheck system "focus";
       });
       formatter = eachSystem (system: (packagesFor system).nixfmt-tree);
       devShells = eachSystem (
