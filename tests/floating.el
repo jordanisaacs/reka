@@ -12,6 +12,7 @@
          (reka--floating-keymap-active nil)
          (reka--last-focused nil)
          (reka--adjusting-floating-layout nil)
+         (reka--floating-selection-context nil)
          (reka-window-created-hook nil)
          (reka-window-geometry-change-hook nil)
          (reka-floating-state-change-hook nil)
@@ -81,6 +82,75 @@
       (should-not (buffer-local-value 'reka-floating child))
       (should (window-live-p (get-buffer-window child t)))
       (should (memq 'child (reka-test--parameter-windows))))))
+
+(ert-deftest reka-floating-detach-keeps-focus-through-deferred-window-hooks ()
+  (reka-test--with-layout
+    (let ((parent (reka--create-buffer 'parent))
+          (child (reka--create-buffer 'child)))
+      (switch-to-buffer parent)
+      (delete-other-windows)
+      (let ((child-window (split-window-right)))
+        (set-window-buffer child-window child)
+        (select-window child-window))
+      (reka--apply-window-geometry child t "reka-frame-test" '(100 90 640 480))
+      (should-not reka--adjusting-floating-layout)
+      (should (eq (window-buffer) parent))
+      ;; Emacs delivers these notifications during redisplay, after the
+      ;; dynamic guard around deleting the child's tiled slot has unwound.
+      (with-current-buffer (window-buffer)
+        (reka--selection-changed (selected-frame))
+        (reka--selection-changed (selected-frame)))
+      (should (eq (reka--active-application-buffer) child))
+      (should reka--floating-keymap-active)
+      (reka-floating-toggle)
+      (should (member '(toggle test-handle child) calls))
+      (should-not (member '(toggle test-handle parent) calls)))))
+
+(ert-deftest reka-floating-explicit-buffer-selection-clears-native-focus ()
+  (reka-test--with-layout
+    (let ((child (reka--create-buffer 'child)))
+      (switch-to-buffer child)
+      (delete-other-windows)
+      (reka--apply-window-geometry child t "reka-frame-test" '(100 90 640 480))
+      (switch-to-buffer (get-buffer-create "*reka-explicit-editing*"))
+      (reka--selection-changed (selected-frame))
+      (should-not reka--focused-floating-buffer)
+      (should-not reka--floating-keymap-active)
+      (should-error (reka-floating-toggle) :type 'user-error))))
+
+(ert-deftest reka-floating-explicit-window-selection-clears-native-focus ()
+  (reka-test--with-layout
+    (switch-to-buffer (get-buffer-create "*reka-selected-before-floating*"))
+    (let* ((other (split-window-right))
+           (dialog (reka--create-buffer 'dialog t)))
+      (set-window-buffer other (get-buffer-create "*reka-explicit-other-window*"))
+      (select-window other)
+      (reka--selection-changed (selected-frame))
+      (should-not reka--focused-floating-buffer)
+      (should-not (eq (reka--active-application-buffer) dialog)))))
+
+(ert-deftest reka-floating-minibuffer-hooks-preserve-the-application-target ()
+  (reka-test--with-layout
+    (let ((dialog (reka--create-buffer 'dialog t))
+          (minibuffer (minibuffer-window)))
+      (cl-letf (((symbol-function 'selected-window) (lambda () minibuffer))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (reka--selection-changed (selected-frame))
+        (should (eq reka--focused-floating-buffer dialog))
+        (should-not reka--floating-keymap-active)
+        (should (equal (car calls) '(focus test-handle nil))))
+      (reka--selection-changed (selected-frame))
+      (should (eq (reka--active-application-buffer) dialog))
+      (should reka--floating-keymap-active))))
+
+(ert-deftest reka-floating-recursive-edit-does-not-mask-explicit-selection ()
+  (reka-test--with-layout
+    (reka--create-buffer 'dialog t)
+    (cl-letf (((symbol-function 'recursion-depth) (lambda () 1)))
+      (switch-to-buffer (get-buffer-create "*reka-recursive-editing*"))
+      (reka--selection-changed (selected-frame))
+      (should-not reka--focused-floating-buffer)
+      (should-not reka--floating-keymap-active))))
 
 (ert-deftest reka-floating-command-target-is-the-native-focused-buffer ()
   (reka-test--with-layout

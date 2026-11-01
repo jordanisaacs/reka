@@ -53,6 +53,10 @@
   "Non-nil while floating application bindings may override ordinary keys.")
 
 (defvar reka--adjusting-floating-layout nil)
+(defvar reka--floating-selection-context nil
+  "Selected frame, window and buffer when native floating focus was assigned.
+Deferred redisplay notifications for that unchanged context are not explicit
+Emacs selections, including notifications caused by detaching a tiled slot.")
 (defvar-local reka--floating-tab nil)
 (defvar-local reka-parent-window nil)
 
@@ -151,7 +155,8 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
                                      (buffer-local-value 'reka-floating-frame-name buf))))
                    ;; Select the logical frame without requesting compositor focus.
                    (select-frame frame 'norecord))
-                 (setq reka--focused-floating-buffer buf))
+                 (setq reka--focused-floating-buffer buf)
+                 (reka--remember-floating-selection))
              (setq reka--focused-floating-buffer nil
 		   reka--floating-keymap-active nil)
              (when-let* ((win (get-buffer-window buf t)))
@@ -216,6 +221,15 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
              (reka--floating-visible-p reka--focused-floating-buffer)
              (zerop (minibuffer-depth))
              (zerop (recursion-depth)))))
+
+(defun reka--selected-context ()
+  "Return the selected frame, window and its displayed buffer."
+  (let ((window (selected-window)))
+    (list (selected-frame) window (window-buffer window))))
+
+(defun reka--remember-floating-selection ()
+  "Record the underlying Emacs selection after assigning floating focus."
+  (setq reka--floating-selection-context (reka--selected-context)))
 
 (defun reka--active-application-buffer ()
   "Return the native-focused floating buffer or the current tiled application."
@@ -401,6 +415,7 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
   (with-current-buffer buffer
     (reka--inherit-parent-location))
   (setq reka--focused-floating-buffer buffer)
+  (reka--remember-floating-selection)
   (reka--refresh-floating-keymap))
 
 (defun reka--apply-window-geometry (buffer floating frame-name geometry)
@@ -469,7 +484,9 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
       (reka--inherit-parent-location)
       (run-hooks 'reka-window-created-hook))
     (if floating
-        (setq reka--focused-floating-buffer buffer)
+        (progn
+          (setq reka--focused-floating-buffer buffer)
+          (reka--remember-floating-selection))
       (display-buffer buffer))
     (reka--refresh-floating-keymap)
     buffer))
@@ -496,7 +513,12 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
 
 (defun reka--selection-changed (&rest arguments)
   "Track an explicit Emacs selection separately from native floating focus."
-  (unless reka--adjusting-floating-layout
+  (unless (or reka--adjusting-floating-layout
+              (and (buffer-live-p reka--focused-floating-buffer)
+                   (or (equal reka--floating-selection-context
+                              (reka--selected-context))
+                       (and (> (minibuffer-depth) 0)
+                            (window-minibuffer-p (selected-window))))))
     (setq reka--focused-floating-buffer nil
           reka--floating-keymap-active nil)
     (when (and (derived-mode-p 'reka-mode) reka-floating)
