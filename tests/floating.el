@@ -140,4 +140,24 @@
   (should (eq (lookup-key reka-mode-map (kbd "C-x w S-<down>")) #'reka-floating-grow-height))
   (should (member "C-x" reka-intercept-prefixes)))
 
+(ert-deftest reka-floating-keys-work-over-an-ordinary-underlying-buffer ()
+  (reka-test--with-layout
+    (let ((dialog (reka--create-buffer 'dialog t))
+          (emulation-mode-map-alists '(reka--floating-emulation-map-alist)))
+      (with-temp-buffer
+        (should (eq (reka--active-application-buffer) dialog))
+        (should (eq (key-binding (kbd "C-x w f")) #'reka-floating-toggle))
+        (should (eq (key-binding (kbd "C-x w <right>")) #'reka-floating-move-right))))))
+
+(ert-deftest reka-floating-focus-can-return-after-an-emacs-command ()
+  (reka-test--with-layout
+    (reka--create-buffer 'dialog t)
+    (with-temp-buffer
+      (let ((this-command 'execute-extended-command))
+        (reka--update-focus-request))
+      (should (equal (car calls) '(focus test-handle nil)))
+      (let ((this-command nil))
+        (reka--update-focus-request))
+      (should (equal (car calls) '(focus test-handle dialog))))))
+
 (ert-run-tests-batch-and-exit)

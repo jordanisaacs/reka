@@ -26,9 +26,9 @@ What else ... the name? Oh, it's obvious to Russian speakers.
 
 ## Status
 
-Most things work, and I use reka as my daily driver. The main feature that is
-still missing is floating windows. There are likely still some bugs and rough
-edges outside of my particular configuration, though, so be ready for that.
+This fork supports tiled and floating application windows. Floating buffers
+belong to an Emacs frame and tab without occupying a tiled Emacs window. There
+may still be bugs and rough edges outside of the tested configurations.
 
 There is **no** simulation key support, this will need a [new
 protocol](https://codeberg.org/river/river/pulls/1412) on the river side.
@@ -40,6 +40,48 @@ I'm not sure that it will. River has external tools
 that are sufficient for me.
 
 If you want something more fully featured, look in the direction of EWM instead!
+
+## Floating windows
+
+Press **Super+f** to toggle the focused application's floating state. Floating
+windows keep their geometry when tiled again and restore it when re-floated;
+their tiled geometry follows the current Emacs layout. Client dialogs with a
+parent, and windows declaring a fixed size, float automatically. Dialogs center
+over their parent and follow its visibility and output. Closing a parent leaves
+an orphaned dialog floating and usable. Native `xdg_popup` menus remain the
+compositor's responsibility.
+
+**Super+left-drag** moves a window and **Super+right-drag** resizes from its
+bottom-right corner. Client title-bar and resize-handle requests use River's
+native pointer operations too. Resizing respects client minimum/maximum sizes
+and the output's usable area. Moving or resizing a tiled application first
+makes it floating. Fullscreen geometry is owned by River; exiting fullscreen
+restores the saved normal placement.
+
+The existing intercepted `C-x` prefix provides these commands in application
+buffers, and while a detached floating application is focused:
+
+| Key | Action |
+| --- | --- |
+| `C-x w f` | Toggle floating |
+| `C-x w c` | Center over parent or output |
+| `C-x w` then an arrow | Move by `reka-floating-step` |
+| `C-x w` then Shift+arrow | Shrink/grow width or height |
+
+The same operations are available as `M-x reka-floating-toggle`,
+`reka-floating-center`, `reka-floating-move`, and `reka-floating-resize`.
+Configure `reka-floating-default-size` (default `(640 . 480)`),
+`reka-floating-step` (default `32` logical pixels), and
+`reka-floating-toggle-key` (default `"s-f"`, or nil to disable its registration)
+before calling `reka-enable`.
+
+Floating state is readable through the application buffer's `reka-floating`,
+`reka-floating-geometry` (`X Y WIDTH HEIGHT`, relative to its output's usable
+area), and `reka-floating-frame-name` variables. The
+`reka-window-created-hook`, `reka-window-geometry-change-hook`, and
+`reka-floating-state-change-hook` run in the corresponding application buffer.
+Ordinary Emacs window/buffer selection clears native floating focus; explicitly
+selecting a floating application's buffer brings it to that frame and tab.
 
 ## Using this
 

@@ -87,36 +87,59 @@ impl Rect {
         area: Rect,
         hints: SizeHints,
     ) -> Self {
-        let w = self.w.saturating_add(if edges.left {
+        let area = Rect {
+            w: area.w.max(1),
+            h: area.h.max(1),
+            ..area
+        };
+        let initial = self.fit(area, SizeHints::default());
+        let available = Rect {
+            x: 0,
+            y: 0,
+            w: if edges.left {
+                initial.x.saturating_sub(area.x).saturating_add(initial.w)
+            } else if edges.right {
+                area.w.saturating_sub(initial.x.saturating_sub(area.x))
+            } else {
+                initial.w
+            },
+            h: if edges.top {
+                initial.y.saturating_sub(area.y).saturating_add(initial.h)
+            } else if edges.bottom {
+                area.h.saturating_sub(initial.y.saturating_sub(area.y))
+            } else {
+                initial.h
+            },
+        };
+        let w = initial.w.saturating_add(if edges.left {
             dx.saturating_neg()
         } else if edges.right {
             dx
         } else {
             0
         });
-        let h = self.h.saturating_add(if edges.top {
+        let h = initial.h.saturating_add(if edges.top {
             dy.saturating_neg()
         } else if edges.bottom {
             dy
         } else {
             0
         });
-        let (w, h) = hints.size(w, h, area);
+        let (w, h) = hints.size(w, h, available);
         Self {
             x: if edges.left {
-                self.x.saturating_add(self.w - w)
+                initial.x.saturating_add(initial.w - w)
             } else {
-                self.x
+                initial.x
             },
             y: if edges.top {
-                self.y.saturating_add(self.h - h)
+                initial.y.saturating_add(initial.h - h)
             } else {
-                self.y
+                initial.y
             },
             w,
             h,
         }
-        .fit(area, hints)
     }
 }
 
@@ -336,6 +359,56 @@ mod tests {
                 x: 1280,
                 y: 0,
                 ..initial
+            }
+        );
+    }
+
+    #[test]
+    fn resizing_against_the_work_area_preserves_the_opposite_corner() {
+        let initial = Rect {
+            x: 200,
+            y: 150,
+            w: 640,
+            h: 480,
+        };
+        let upper_left = initial.resized(
+            -1000,
+            -1000,
+            ResizeEdges {
+                left: true,
+                top: true,
+                ..Default::default()
+            },
+            AREA,
+            SizeHints::default(),
+        );
+        assert_eq!(
+            upper_left,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 840,
+                h: 630
+            }
+        );
+        let lower_right = initial.resized(
+            10000,
+            10000,
+            ResizeEdges {
+                right: true,
+                bottom: true,
+                ..Default::default()
+            },
+            AREA,
+            SizeHints::default(),
+        );
+        assert_eq!(
+            lower_right,
+            Rect {
+                x: 200,
+                y: 150,
+                w: 1720,
+                h: 890
             }
         );
     }
