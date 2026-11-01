@@ -77,7 +77,6 @@ use_symbols!(
     title_change
     app_id_change
     frame_request
-    discard_frame
     toggle_fullscreen
     toggle_floating
     window_geometry
@@ -205,7 +204,6 @@ enum ToEmacs {
     MinimizeRequested(RiverWindowV1),
     WindowGeometry(RiverWindowV1, bool, String, Rect),
     RequestFrame,
-    DiscardFrame(String),
     Message(String),
 }
 
@@ -252,7 +250,6 @@ impl<'e> IntoLisp<'e> for ToEmacs {
                 ),
             ),
             ToEmacs::RequestFrame => frame_request.into_lisp(env),
-            ToEmacs::DiscardFrame(frame_name) => env.call(cons, (discard_frame, frame_name)),
             ToEmacs::Message(text) => env.cons(message, text),
         }
     }
@@ -1560,6 +1557,19 @@ impl Reka {
             self.focus.focus_frame(frame);
         }
 
+        // A frame survives output removal, including while another VT is
+        // active. Preserve its selected application and defer native focus
+        // until that same frame can be displayed again.
+        if let Some((_, frame)) = self.focus.current_focus_and_frame()
+            && self
+                .frames
+                .get(frame)
+                .and_then(|frame| frame.displayed_on.as_ref())
+                .is_none()
+        {
+            return;
+        }
+
         let is_dirty = self.focus.is_dirty();
         let (target, frame) = self.focus.current_focus_and_frame().unwrap();
 
@@ -2050,20 +2060,22 @@ impl Dispatch<RiverOutputV1, ()> for Reka {
         match event {
             river::river_output_v1::Event::Removed => {
                 log::info!("an output was disconnected, removing");
-                let Some(output) = state.outputs.remove(proxy) else {
+                let Some(_output) = state.outputs.remove(proxy) else {
                     log::warn!("unknown output disconnected");
                     return;
                 };
 
-                let Some(frame_name) = state
-                    .frame_by_output(&output.proxy)
-                    .and_then(|f| f.name.clone())
-                else {
-                    log::warn!("disconnected output had no frame");
-                    return;
-                };
-
-                state.send(ToEmacs::DiscardFrame(frame_name));
+                // VT deactivation removes even physically connected outputs.
+                // Keep Emacs frames, their tabs and application layouts alive:
+                // reconcile_frames can reuse them when an output comes back.
+                // A stale output reference prevents that reuse and leaves app
+                // buffers permanently attached to an undisplayed frame.
+                for frame in state.frames.values_mut() {
+                    if frame.displayed_on.as_ref() == Some(proxy) {
+                        frame.displayed_on = None;
+                        state.focus.mark_dirty();
+                    }
+                }
             }
             river::river_output_v1::Event::Position { x, y } => {
                 log::debug!("output position: x={}, y={}", x, y);

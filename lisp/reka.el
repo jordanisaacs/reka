@@ -189,11 +189,6 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
 
         ('frame-request (make-frame))
 
-        (`(discard-frame . ,frame-name)
-         (when-let* ((frame-names (make-frame-names-alist))
-                     (frame (alist-get frame-name frame-names nil nil #'equal)))
-           (delete-frame frame)))
-
         (`(message . ,msg)
          (message "reka: %s" msg))
 

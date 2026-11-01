@@ -39,6 +39,12 @@ I'm not sure that it will. River has external tools
 [kanshi](https://gitlab.freedesktop.org/emersion/kanshi) for output management)
 that are sufficient for me.
 
+Output disappearance, including while switching to another Linux virtual
+terminal, preserves Emacs frames and their tabs/application layouts. Frames are
+hidden until an output is available again, then reused. Native focus requests
+wait for the selected frame to be displayed, preserving its application focus
+across the interruption.
+
 If you want something more fully featured, look in the direction of EWM instead!
 
 ## Floating windows
