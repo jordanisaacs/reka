@@ -73,6 +73,11 @@ Emacs selections, including notifications caused by detaching a tiled slot.")
 (defvar-local reka-floating nil
   "Non-nil when this buffer's native window is floating.")
 
+(defvar-local reka-identifier nil
+  "Stable compositor identifier of this application window.
+Matches the corresponding ext-foreign-toplevel-list identifier; unlike an
+application title or PID, it distinguishes windows across manager handoffs.")
+
 (defvar-local reka-floating-geometry nil
   "Last native window geometry as (X Y WIDTH HEIGHT), in logical pixels.
 Coordinates are relative to the usable area of `reka-floating-frame-name'.")
@@ -182,6 +187,11 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
            (with-current-buffer buf
              (setq reka-app-id app-id))))
 
+        (`(identifier-change ,window ,identifier)
+         (when-let* ((buf (reka--find-buffer-for-window window)))
+           (with-current-buffer buf
+             (setq reka-identifier identifier))))
+
         (`(title-change ,window ,title)
          (when-let* ((buf (reka--find-buffer-for-window window)))
            (with-current-buffer buf
@@ -261,6 +271,18 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
   "Toggle this buffer's native window between tiled and floating placement."
   (interactive)
   (reka-toggle-window-floating reka-handle (reka--require-window)))
+
+(defun reka-request-close (&optional buffer)
+  "Ask BUFFER's application to close without destroying its Emacs buffer.
+The application may open a save dialog or decline.  Its layout and input
+remain available until the compositor reports that the window has closed."
+  (interactive)
+  (if buffer
+      (with-current-buffer buffer
+        (unless (and reka-handle reka-window)
+          (user-error "There is no Reka application in this buffer"))
+        (reka-close-window reka-handle reka-window))
+    (reka-close-window reka-handle (reka--require-window))))
 
 (defun reka-floating-center ()
   "Float and center this window over its parent or the current output."

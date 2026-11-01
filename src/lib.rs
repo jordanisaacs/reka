@@ -76,6 +76,7 @@ use_symbols!(
     focused
     title_change
     app_id_change
+    identifier_change
     frame_request
     toggle_fullscreen
     toggle_floating
@@ -201,6 +202,7 @@ enum ToEmacs {
     Focused(RiverWindowV1),
     TitleChange(RiverWindowV1, String),
     AppIDChange(RiverWindowV1, String),
+    IdentifierChange(RiverWindowV1, String),
     MinimizeRequested(RiverWindowV1),
     WindowGeometry(RiverWindowV1, bool, String, Rect),
     RequestFrame,
@@ -232,6 +234,9 @@ impl<'e> IntoLisp<'e> for ToEmacs {
             ToEmacs::Focused(win) => env.call(cons, (focused, RefCell::new(win))),
             ToEmacs::AppIDChange(win, app_id) => {
                 env.call(list, (app_id_change, RefCell::new(win), app_id))
+            }
+            ToEmacs::IdentifierChange(win, identifier) => {
+                env.call(list, (identifier_change, RefCell::new(win), identifier))
             }
             ToEmacs::TitleChange(win, title) => {
                 env.call(list, (title_change, RefCell::new(win), title))
@@ -761,7 +766,6 @@ impl Drop for Frame {
 enum WindowState {
     Starting,
     Active,
-    Killed,
 }
 
 #[derive(Debug)]
@@ -779,6 +783,8 @@ struct Window {
     announced: bool,
     title: Option<String>,
     app_id: Option<String>,
+    identifier: Option<String>,
+    close_requested: bool,
 }
 
 impl Drop for Window {
@@ -1619,9 +1625,16 @@ impl Reka {
 
     // reconcile_windows closes killed windows and removes them from the list
     fn reconcile_windows(&mut self) {
+        // Closing is a request, not a lifecycle transition: a client may ask
+        // to save its work or decline. Keep its layout and focus usable, and
+        // never send another close merely because a manage sequence occurs.
+        for window in self.windows.values_mut() {
+            if std::mem::take(&mut window.close_requested) {
+                window.proxy.close();
+            }
+        }
         for (proxy, window) in &self.windows {
             match window.state {
-                WindowState::Killed => proxy.close(),
                 WindowState::Starting => {}
                 WindowState::Active => {
                     proxy.set_capabilities(
@@ -1749,7 +1762,7 @@ impl Reka {
                 }
                 FromEmacs::CloseWindow(window) => {
                     if let Some(w) = self.windows.get_mut(&window) {
-                        w.state = WindowState::Killed;
+                        w.close_requested = true;
                         needs_manage = true;
                     }
                 }
@@ -1757,14 +1770,17 @@ impl Reka {
                     let metadata = if let Some(w) = self.windows.get_mut(&window) {
                         needs_manage = true;
                         w.state = WindowState::Active;
-                        Some((w.app_id.clone(), w.title.clone()))
+                        Some((w.app_id.clone(), w.title.clone(), w.identifier.clone()))
                     } else {
                         None
                     };
                     // Initial metadata often precedes Emacs buffer creation.
                     // Replay after its acknowledgement, with app-id first so
                     // the subsequent title produces the correct buffer name.
-                    if let Some((app_id, title)) = metadata {
+                    if let Some((app_id, title, identifier)) = metadata {
+                        if let Some(identifier) = identifier {
+                            self.send(ToEmacs::IdentifierChange(window.clone(), identifier));
+                        }
                         if let Some(app_id) = app_id {
                             self.send(ToEmacs::AppIDChange(window.clone(), app_id));
                         }
@@ -2270,8 +2286,16 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                         announced: false,
                         title: None,
                         app_id: None,
+                        identifier: None,
+                        close_requested: false,
                     },
                 );
+            }
+            river::river_window_v1::Event::Identifier { identifier } => {
+                if let Some(window) = state.windows.get_mut(proxy) {
+                    window.identifier = Some(identifier.clone());
+                    state.send(ToEmacs::IdentifierChange(proxy.clone(), identifier));
+                }
             }
             river::river_window_v1::Event::AppId {
                 app_id: Some(app_id),

@@ -56,6 +56,16 @@
       (should (get-buffer-window application t))
       (should (eq (window-buffer (selected-window)) application)))))
 
+(ert-deftest reka-close-request-preserves-the-application-buffer-and-layout ()
+  (reka-test--with-layout
+    (let ((application (reka--create-buffer 'application)))
+      (setq calls nil)
+      (reka-request-close application)
+      (should (buffer-live-p application))
+      (should (get-buffer-window application t))
+      (should (eq (window-buffer (selected-window)) application))
+      (should (equal calls '((close test-handle application)))))))
+
 (ert-deftest reka-new-tiled-application-selects-its-own-tile ()
   (reka-test--with-layout
     (let ((first (reka--create-buffer 'first)))
