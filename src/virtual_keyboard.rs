@@ -244,21 +244,28 @@ impl VirtualKeyboard {
         if self.active_seat == Some(name) {
             self.remove_seat();
         }
-        if let Some(seat) = self.seats.remove(&name) {
-            if seat.version() >= 5 {
-                seat.release();
-            }
+        if let Some(seat) = self.seats.remove(&name)
+            && seat.version() >= 5
+        {
+            seat.release();
         }
         if self
             .manager
             .as_ref()
             .is_some_and(|(global, _)| *global == name)
-            || self
-                .standard_manager
-                .as_ref()
-                .is_some_and(|(global, _)| *global == name)
         {
-            self.reset();
+            self.clear_keyboard();
+            if let Some((_, manager)) = self.manager.take() {
+                manager.destroy();
+            }
+        }
+        if self
+            .standard_manager
+            .as_ref()
+            .is_some_and(|(global, _)| *global == name)
+        {
+            self.clear_keyboard();
+            self.standard_manager.take();
         }
     }
 
@@ -287,12 +294,21 @@ impl VirtualKeyboard {
             .store(self.keyboard.is_some() && !self.locked, Ordering::Release);
     }
 
-    pub(crate) fn remove_seat(&mut self) {
+    fn clear_keyboard(&mut self) {
         self.ready.store(false, Ordering::Release);
         self.pending.clear();
         if let Some(keyboard) = self.keyboard.take() {
             keyboard.destroy();
         }
+    }
+
+    pub(crate) fn restart(&mut self, queue: &QueueHandle<crate::Reka>) {
+        self.clear_keyboard();
+        self.initialize(queue);
+    }
+
+    pub(crate) fn remove_seat(&mut self) {
+        self.clear_keyboard();
         self.active_seat = None;
     }
 

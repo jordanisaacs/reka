@@ -175,6 +175,7 @@ enum FloatingCommand {
 enum FromEmacs {
     RegisterPrefix(XKBPrefix, Command),
     SimulateKeys(virtual_keyboard::Request),
+    ResetVirtualKeyboard,
     FocusWindow(RiverWindowV1),
     FocusFrame,
     CloseWindow(RiverWindowV1),
@@ -279,6 +280,17 @@ fn close_window<'e>(env: &'e Env, handle: &Handle, window: &RiverWindowV1) -> Re
 #[defun]
 fn virtual_keyboard_available_p(handle: &Handle) -> Result<bool> {
     Ok(handle.virtual_keyboard_ready.load(Ordering::Acquire))
+}
+
+/// Discard queued simulations and recreate the active seat's virtual keyboard.
+/// This can recover a simulation client without restarting the window manager.
+#[defun]
+fn reset_virtual_keyboard<'e>(env: &'e Env, handle: &Handle) -> Result<Value<'e>> {
+    handle
+        .virtual_keyboard_ready
+        .store(false, Ordering::Release);
+    handle.send(FromEmacs::ResetVirtualKeyboard)?;
+    ().into_lisp(env)
 }
 
 /// Send a bounded vector of [KEY MODIFIERS] strokes to an explicit managed
@@ -1596,6 +1608,9 @@ impl Reka {
         while let Ok(msg) = self.rx.try_recv() {
             log::debug!("message from emacs: {:?}", msg);
             match msg {
+                FromEmacs::ResetVirtualKeyboard => {
+                    self.virtual_keyboard.restart(qh);
+                }
                 FromEmacs::SimulateKeys(request) => {
                     if let Err(error) = self.virtual_keyboard.enqueue(request) {
                         self.send(ToEmacs::Message(error.to_string()));

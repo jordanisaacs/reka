@@ -1,0 +1,71 @@
+--- a/river/Seat.zig
++++ b/river/Seat.zig
+@@ -1252,18 +1252,32 @@
+ 
+ fn keyboardNotifyEnter(seat: *Seat, wlr_surface: *wlr.Surface) void {
+     if (seat.wlr_seat.getKeyboard()) |wlr_keyboard| {
+-        const group: *KeyboardGroup = @ptrCast(@alignCast(wlr_keyboard.data));
+-
+-        var buffer: [KeyboardGroup.pressed_count_max]u32 = undefined;
+-        var keycodes: std.ArrayList(u32) = .initBuffer(&buffer);
+-        for (group.pressed.keys(), group.pressed.values()) |keycode, press| {
+-            if (press.consumer == .focus) keycodes.appendAssumeCapacity(keycode);
+-        }
+-
++        // Only KeyboardGroup keyboards carry a group pointer and have keys
++        // consumed by compositor bindings. SyncedVirtKb keyboards are separate
++        // wlr.Keyboard instances, so their data pointer must not be cast.
++        var groups = seat.keyboard_groups.iterator(.forward);
++        while (groups.next()) |group| {
++            if (&group.state != wlr_keyboard) continue;
++
++            var buffer: [KeyboardGroup.pressed_count_max]u32 = undefined;
++            var keycodes: std.ArrayList(u32) = .initBuffer(&buffer);
++            for (group.pressed.keys(), group.pressed.values()) |keycode, press| {
++                if (press.consumer == .focus) keycodes.appendAssumeCapacity(keycode);
++            }
++            seat.wlr_seat.keyboardNotifyEnter(
++                wlr_surface,
++                keycodes.items,
++                &group.state.modifiers,
++            );
++            return;
++        }
++
++        // Synchronized virtual keyboard events bypass binding consumption.
++        // Preserve their real pressed-key/modifier state on a focus change.
+         seat.wlr_seat.keyboardNotifyEnter(
+             wlr_surface,
+-            keycodes.items,
+-            &group.state.modifiers,
++            wlr_keyboard.keycodes[0..wlr_keyboard.num_keycodes],
++            &wlr_keyboard.modifiers,
+         );
+     } else {
+         seat.wlr_seat.keyboardNotifyEnter(wlr_surface, &.{}, null);
+--- a/river/SyncedVirtKb.zig
++++ b/river/SyncedVirtKb.zig
+@@ -73,6 +73,15 @@
+ pub fn destroy(synced_virt_kb: *SyncedVirtKb) void {
+     assert(synced_virt_kb.queued_events == 0);
+ 
++    // The WM can disappear before wlroots destroys this keyboard resource.
++    // Never leave listeners pointing at a freed SyncedVirtKb in that case.
++    if (synced_virt_kb.wlr_virt_kb != null) {
++        synced_virt_kb.wlr_virt_kb_destroy.link.remove();
++        synced_virt_kb.queue_key.link.remove();
++        synced_virt_kb.queue_modifiers.link.remove();
++        synced_virt_kb.queue_keymap.link.remove();
++    }
++
+     // If the currently active keyboard of a seat is destroyed we need to set
+     // a new active keyboard. Otherwise wlroots may send an enter event without
+     // first having sent a keymap event if Seat.keyboardNotifyEnter() is called
+@@ -107,6 +116,7 @@
+     synced_virt_kb.queue_key.link.remove();
+     synced_virt_kb.queue_modifiers.link.remove();
+     synced_virt_kb.queue_keymap.link.remove();
++    synced_virt_kb.maybeDestroy();
+ }
+ 
+ fn queueKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboard.event.Key) void {

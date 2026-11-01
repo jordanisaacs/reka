@@ -53,4 +53,30 @@
       (should (commandp (lookup-key reka-mode-map (kbd "C-f"))))
       (should (equal (global-key-binding (kbd "C-f")) global-before)))))
 
+(ert-deftest reka-simulation-definitions-include-detached-floating-map ()
+  (let ((reka-handle 'handle)
+        (reka-mode-map (make-sparse-keymap)))
+    (cl-progv '(reka-floating-command-map) (list (make-sparse-keymap))
+      (cl-letf (((symbol-function 'reka-push-intercept-prefix) (lambda (_) nil)))
+        (reka-define-simulation-key "C-f" "<right>")
+        (should (eq (lookup-key reka-mode-map (kbd "C-f"))
+                    (lookup-key (symbol-value 'reka-floating-command-map) (kbd "C-f"))))))))
+
+(ert-deftest reka-simulation-targets-the-focused-detached-float ()
+  (let ((floating (generate-new-buffer " *reka-floating-test*"))
+        (reka-handle 'handle)
+        delivered)
+    (unwind-protect
+        (with-temp-buffer
+          (with-current-buffer floating
+            (setq major-mode 'reka-mode)
+            (setq-local reka-window 'floating-window))
+          (cl-letf (((symbol-function 'reka--active-application-buffer) (lambda () floating))
+                    ((symbol-function 'reka-virtual-keyboard-available-p) (lambda (_) t))
+                    ((symbol-function 'reka-inject-key-sequence)
+                     (lambda (&rest arguments) (setq delivered arguments))))
+            (reka-send-keys "C-v")
+            (should (equal delivered '(handle floating-window [[118 4]])))))
+      (kill-buffer floating))))
+
 (ert-run-tests-batch-and-exit)
