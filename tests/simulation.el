@@ -79,4 +79,3 @@
             (should (equal delivered '(handle floating-window [[118 4]])))))
       (kill-buffer floating))))
 
-(ert-run-tests-batch-and-exit)

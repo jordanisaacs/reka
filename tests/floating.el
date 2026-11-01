@@ -272,4 +272,3 @@
       (should-not (reka--floating-visible-p dialog))
       (should-not (memq 'dialog (reka-test--parameter-windows))))))
 
-(ert-run-tests-batch-and-exit)
