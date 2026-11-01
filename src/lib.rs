@@ -80,6 +80,8 @@ use_symbols!(
     window_geometry
     parent_changed
     frame_focused
+    frame_parameter
+    frame_name_parameter => "name"
     message
     reka_get_window => "reka--get-window"
     reka_create_buffer => "reka--create-buffer"
@@ -177,7 +179,7 @@ enum FromEmacs {
     SimulateKeys(virtual_keyboard::Request),
     ResetVirtualKeyboard,
     FocusWindow(RiverWindowV1),
-    FocusFrame,
+    FocusFrame(String),
     CloseWindow(RiverWindowV1),
     BufferCreated(RiverWindowV1),
     UpdateParameters(HashMap<RiverWindowV1, WindowParameters>),
@@ -524,7 +526,10 @@ fn set_focus_request<'e>(env: &'e Env, handle: &Handle, window: Value<'e>) -> Re
         let cell: &RefCell<RiverWindowV1> = window.into_rust()?;
         handle.send(FromEmacs::FocusWindow(cell.borrow().clone()))?;
     } else {
-        handle.send(FromEmacs::FocusFrame)?;
+        let frame_name: String = env
+            .call(frame_parameter, ((), frame_name_parameter))?
+            .into_rust()?;
+        handle.send(FromEmacs::FocusFrame(frame_name))?;
     }
 
     ().into_lisp(env)
@@ -641,6 +646,7 @@ fn wm_loop(
         float_size: (640, 480),
         stacking_serial: 0,
         pointer_window: None,
+        pointer_position: None,
         pointer_operation: None,
         pointer_bindings: Vec::new(),
     };
@@ -787,6 +793,7 @@ struct PointerOperation {
     seat: river::river_seat_v1::RiverSeatV1,
     action: PointerAction,
     initial: Rect,
+    start_size: Option<(i32, i32)>,
     started: bool,
     released: bool,
 }
@@ -942,6 +949,7 @@ struct Reka {
     float_size: (i32, i32),
     stacking_serial: u64,
     pointer_window: Option<RiverWindowV1>,
+    pointer_position: Option<(i32, i32)>,
     pointer_operation: Option<PointerOperation>,
     pointer_bindings: Vec<PointerBinding>,
 }
@@ -1248,16 +1256,27 @@ impl Reka {
         {
             return;
         }
-        self.floating_command(proxy, FloatingCommand::Set(true));
         let Some(display) = self.display_placement(proxy) else {
             return;
         };
-        let Some(window) = self.windows.get(proxy) else {
+        let Some(window) = self.windows.get_mut(proxy) else {
             return;
         };
-        if !window.placement.floating() {
-            return;
-        }
+        let from_tiled = !window.placement.floating();
+        let start_size = if from_tiled && matches!(action, PointerAction::Move) {
+            Some(
+                window
+                    .placement
+                    .geometry
+                    .map(|rect| (rect.w, rect.h))
+                    .unwrap_or(self.float_size),
+            )
+        } else {
+            None
+        };
+        window.placement.explicit = Some(true);
+        window.placement.geometry = Some(display.rect);
+        self.raise_window(proxy);
         self.focus.focus_window(proxy.clone(), display.frame);
         self.focus.mark_dirty();
         self.pointer_operation = Some(PointerOperation {
@@ -1265,6 +1284,7 @@ impl Reka {
             seat,
             action,
             initial: display.rect,
+            start_size,
             started: false,
             released: false,
         });
@@ -1301,6 +1321,38 @@ impl Reka {
                 && !self.window_is_fullscreen(&operation.window);
             if !valid {
                 self.pointer_operation.as_mut().unwrap().released = true;
+            }
+        }
+        // PointerPosition may follow the initiating button/client event in
+        // the same batch. Use its final value at manage_start, not stale input.
+        let start_geometry = self.pointer_operation.as_ref().and_then(|operation| {
+            let (width, height) = operation.start_size?;
+            if operation.started || operation.released {
+                return None;
+            }
+            let display = self.display_placement(&operation.window)?;
+            let hints = self.windows.get(&operation.window)?.hints;
+            let geometry = if let Some((x, y)) = self.pointer_position {
+                let output = self.outputs.get(&display.output)?;
+                operation.initial.grabbed(
+                    width,
+                    height,
+                    (x.saturating_sub(output.x), y.saturating_sub(output.y)),
+                    display.area,
+                    hints,
+                )
+            } else {
+                Rect::centered(width, height, display.area, display.area, hints)
+            };
+            Some(geometry)
+        });
+        if let Some(geometry) = start_geometry
+            && let Some(operation) = &mut self.pointer_operation
+        {
+            operation.initial = geometry;
+            operation.start_size = None;
+            if let Some(window) = self.windows.get_mut(&operation.window) {
+                window.placement.geometry = Some(geometry);
             }
         }
         if let Some(operation) = &mut self.pointer_operation {
@@ -1643,10 +1695,17 @@ impl Reka {
                     self.raise_window(&window);
                     self.focus.focus_window(window, frame);
                 }
-                FromEmacs::FocusFrame => {
-                    // TODO: explicit selection?
+                FromEmacs::FocusFrame(frame_name) => {
                     needs_manage = true;
-                    self.focus.switch_to_frame();
+                    let frame = self
+                        .frame_by_name(&frame_name)
+                        .filter(|frame| frame.displayed_on.is_some())
+                        .map(|frame| frame.proxy.clone());
+                    if let Some(frame) = frame {
+                        self.focus.focus_frame(frame);
+                    } else {
+                        self.focus.switch_to_frame();
+                    }
                 }
                 FromEmacs::CloseWindow(window) => {
                     if let Some(w) = self.windows.get_mut(&window) {
@@ -2045,6 +2104,9 @@ impl Dispatch<river::river_seat_v1::RiverSeatV1, ()> for Reka {
             river::river_seat_v1::Event::PointerLeave => {
                 state.pointer_window = None;
             }
+            river::river_seat_v1::Event::PointerPosition { x, y } => {
+                state.pointer_position = Some((x, y));
+            }
             river::river_seat_v1::Event::OpDelta { dx, dy } => state.pointer_delta(dx, dy),
             river::river_seat_v1::Event::OpRelease => {
                 if let Some(operation) = &mut state.pointer_operation {
@@ -2054,6 +2116,7 @@ impl Dispatch<river::river_seat_v1::RiverSeatV1, ()> for Reka {
             river::river_seat_v1::Event::Removed => {
                 state.pointer_operation = None;
                 state.pointer_window = None;
+                state.pointer_position = None;
                 state.pointer_bindings.clear();
                 state.seat = None;
             }

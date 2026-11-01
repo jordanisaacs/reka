@@ -9,6 +9,7 @@
   (declare (indent 0) (debug t))
   `(let ((reka-handle 'test-handle)
          (reka--focused-floating-buffer nil)
+         (reka--floating-keymap-active nil)
          (reka--last-focused nil)
          (reka--adjusting-floating-layout nil)
          (reka-window-created-hook nil)
@@ -159,5 +160,46 @@
       (let ((this-command nil))
         (reka--update-focus-request))
       (should (equal (car calls) '(focus test-handle dialog))))))
+
+(ert-deftest reka-floating-emulation-does-not-capture-minibuffer-editing ()
+  (reka-test--with-layout
+    (let ((dialog (reka--create-buffer 'dialog t))
+          (emulation-mode-map-alists '(reka--floating-emulation-map-alist)))
+      (with-temp-buffer
+        (should (eq (key-binding (kbd "C-x w f")) #'reka-floating-toggle))
+        (cl-letf (((symbol-function 'minibuffer-depth) (lambda () 1)))
+          (reka--refresh-floating-keymap)
+          (should-not reka--floating-keymap-active)
+          (should-not (eq (key-binding (kbd "C-x w f")) #'reka-floating-toggle))
+          ;; A completed application command can still find its explicit target.
+          (should (eq (reka--active-application-buffer) dialog)))
+        (reka--refresh-floating-keymap)
+        (should reka--floating-keymap-active)
+        (should (eq (key-binding (kbd "C-x w f")) #'reka-floating-toggle))))))
+
+(ert-deftest reka-floating-parent-reused-in-another-tab-keeps-dialogs-visible ()
+  (reka-test--with-layout
+    (let* ((tab-bar-tab-post-open-functions '(reka--new-tab))
+           (parent (reka--create-buffer 'parent)))
+      (switch-to-buffer parent)
+      (delete-other-windows)
+      (reka--all-window-parameters)
+      (let ((old-id (buffer-local-value 'reka--floating-tab parent)))
+        (tab-bar-new-tab)
+        (switch-to-buffer parent)
+        (delete-other-windows)
+        (reka--all-window-parameters)
+        (should-not (eq old-id (buffer-local-value 'reka--floating-tab parent)))
+        (should (reka--floating-visible-p (reka--create-buffer 'dialog t 'parent)))))))
+
+(ert-deftest reka-floating-pending-geometry-does-not-unminimize-a-dialog ()
+  (reka-test--with-layout
+    (reka--create-buffer 'parent)
+    (let ((dialog (reka--create-buffer 'dialog t 'parent)))
+      (with-current-buffer dialog (setq reka--floating-tab nil))
+      (reka--apply-window-geometry dialog t "reka-frame-test" '(20 30 400 300))
+      (should-not (buffer-local-value 'reka--floating-tab dialog))
+      (should-not (reka--floating-visible-p dialog))
+      (should-not (memq 'dialog (reka-test--parameter-windows))))))
 
 (ert-run-tests-batch-and-exit)

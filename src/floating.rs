@@ -78,6 +78,31 @@ impl Rect {
         .fit(area, hints)
     }
 
+    /// Shrink a tiled window while retaining the pointer's proportional grab.
+    pub fn grabbed(
+        self,
+        w: i32,
+        h: i32,
+        pointer: (i32, i32),
+        area: Rect,
+        hints: SizeHints,
+    ) -> Self {
+        let (w, h) = hints.size(w, h, area);
+        let offset_x = pointer.0.saturating_sub(self.x).clamp(0, self.w.max(1));
+        let offset_y = pointer.1.saturating_sub(self.y).clamp(0, self.h.max(1));
+        Self {
+            x: pointer.0.saturating_sub(
+                (i64::from(offset_x) * i64::from(w) / i64::from(self.w.max(1))) as i32,
+            ),
+            y: pointer.1.saturating_sub(
+                (i64::from(offset_y) * i64::from(h) / i64::from(self.h.max(1))) as i32,
+            ),
+            w,
+            h,
+        }
+        .fit(area, hints)
+    }
+
     /// Resize from cumulative motion, keeping the opposite corner anchored.
     pub fn resized(
         self,
@@ -411,6 +436,28 @@ mod tests {
                 h: 890
             }
         );
+    }
+
+    #[test]
+    fn a_tiled_pointer_move_keeps_the_grab_point_when_floating() {
+        let tiled = Rect {
+            x: 100,
+            y: 50,
+            w: 1000,
+            h: 800,
+        };
+        let floating = tiled.grabbed(640, 480, (600, 70), AREA, SizeHints::default());
+        assert_eq!(
+            floating,
+            Rect {
+                x: 280,
+                y: 58,
+                w: 640,
+                h: 480
+            }
+        );
+        assert_eq!(floating.x + floating.w / 2, 600);
+        assert_eq!(floating.y + floating.h * 20 / 800, 70);
     }
 
     #[test]
