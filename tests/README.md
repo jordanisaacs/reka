@@ -19,6 +19,8 @@ screenshots are kept there for failure diagnosis. Without `--output-dir`, a
 temporary directory is removed after the run. `--module` also accepts a locally
 built `target/debug/libreka.so`. The existing keyboard integration can use the
 same tools/module arguments, with `wev` additionally available on PATH.
+`--lisp-dir` can select the matching packaged or development Lisp directory
+when testing a module built from another checkout.
 
 The floating integration uses two real GTK3 applications, one with a transient
 dialog and native min/max size hints. Its small fixture clients request normal

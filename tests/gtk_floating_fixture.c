@@ -1,6 +1,5 @@
 /* Real xdg-toplevel parents, transient dialogs and client pointer requests. */
 #include <gtk/gtk.h>
-#include <gdk/gdkwayland.h>
 #include <glib-unix.h>
 #include <stdio.h>
 #include <string.h>
@@ -75,8 +74,6 @@ static GtkWidget *window(const char *role, GtkWidget *transient) {
     g_signal_connect(widget, "key-press-event", G_CALLBACK(key), (gpointer)role);
     g_signal_connect(widget, "button-press-event", G_CALLBACK(press), (gpointer)role);
     g_signal_connect(widget, "destroy", G_CALLBACK(destroyed), (gpointer)role);
-    gtk_widget_realize(widget);
-    gdk_wayland_window_set_application_id(gtk_widget_get_window(widget), "org.reka.FloatingFixture");
     gtk_widget_show_all(widget);
     return widget;
 }

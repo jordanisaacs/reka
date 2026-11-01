@@ -57,13 +57,14 @@ class Session:
         self.children = []
         self.logs = []
 
-    def start(self, module):
+    def start(self, module, lisp_dir=None):
         root = self.root
         source = Path(__file__).resolve().parents[1]
+        lisp_dir = lisp_dir or source / "lisp"
         startup = root / "startup.el"
         startup.write_text(
             f"(add-to-list 'load-path {json.dumps(str(module.parent))})\n"
-            f"(add-to-list 'load-path {json.dumps(str(source / 'lisp'))})\n"
+            f"(add-to-list 'load-path {json.dumps(str(lisp_dir))})\n"
             "(require 'reka)\n(require 'reka-simulation)\n(require 'json)\n"
             '(setq tab-bar-new-tab-choice "*reka-empty-tab*")\n'
             '(get-buffer-create "*reka-empty-tab*")\n'
@@ -250,6 +251,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", type=Path, default=Path("target/debug/libreka.so"))
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--lisp-dir", type=Path, default=Path(__file__).resolve().parents[1] / "lisp"
+    )
     arguments = parser.parse_args()
     module = arguments.module.resolve()
     assert module.is_file(), "Build libreka.so before running integration tests"
@@ -261,7 +265,7 @@ def main():
     session = None
     try:
         session = Session(root)
-        session.start(module)
+        session.start(module, arguments.lisp_dir.resolve())
         parent = session.launch(["reka-gtk-fixture", "parent"], "parent")
         session.wait_role("parent", False)
         session.evaluate(
@@ -448,9 +452,15 @@ def main():
         for role in ("parent", "dialog", "second"):
             metadata = session.wait_role(role)
             assert metadata["name"].startswith("Reka fixture " + role), metadata
-            assert metadata["app-id"] == "org.reka.FloatingFixture", metadata
+            assert metadata["app-id"] == "reka-floating-fixture", metadata
         print(
             "PASS: initial real client title and app-id survive asynchronous buffer creation"
+        )
+
+        # The ordinary editing test deliberately replaced a tiled app. Restore
+        # both applications before testing whether their tab layout survives.
+        session.evaluate(
+            '(progn (delete-other-windows) (switch-to-buffer (reka-it-buffer "parent")) (set-window-buffer (split-window-right) (reka-it-buffer "second")) (redisplay t))'
         )
 
         session.evaluate(
