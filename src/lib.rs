@@ -773,6 +773,8 @@ struct Window {
     stacking_order: u64,
     reported_geometry: Option<(bool, String, Rect)>,
     announced: bool,
+    title: Option<String>,
+    app_id: Option<String>,
 }
 
 impl Drop for Window {
@@ -1714,9 +1716,23 @@ impl Reka {
                     }
                 }
                 FromEmacs::BufferCreated(window) => {
-                    if let Some(w) = self.windows.get_mut(&window) {
+                    let metadata = if let Some(w) = self.windows.get_mut(&window) {
                         needs_manage = true;
                         w.state = WindowState::Active;
+                        Some((w.app_id.clone(), w.title.clone()))
+                    } else {
+                        None
+                    };
+                    // Initial metadata often precedes Emacs buffer creation.
+                    // Replay after its acknowledgement, with app-id first so
+                    // the subsequent title produces the correct buffer name.
+                    if let Some((app_id, title)) = metadata {
+                        if let Some(app_id) = app_id {
+                            self.send(ToEmacs::AppIDChange(window.clone(), app_id));
+                        }
+                        if let Some(title) = title {
+                            self.send(ToEmacs::TitleChange(window.clone(), title));
+                        }
                     }
                 }
                 FromEmacs::Floating(proxy, command) => {
@@ -2183,6 +2199,8 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                         stacking_order: state.stacking_serial,
                         reported_geometry: None,
                         announced: false,
+                        title: None,
+                        app_id: None,
                     },
                 );
             }
@@ -2192,7 +2210,9 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                 if app_id.is_empty() {
                     return;
                 }
-
+                if let Some(window) = state.windows.get_mut(proxy) {
+                    window.app_id = Some(app_id.clone());
+                }
                 state.send(ToEmacs::AppIDChange(proxy.clone(), app_id));
             }
             river::river_window_v1::Event::Title { title: Some(title) } => {
@@ -2206,7 +2226,9 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                     f.name = Some(title);
                     return;
                 }
-
+                if let Some(window) = state.windows.get_mut(proxy) {
+                    window.title = Some(title.clone());
+                }
                 state.send(ToEmacs::TitleChange(proxy.clone(), title.clone()));
 
                 if !state.windows.contains_key(proxy) {
