@@ -4,6 +4,7 @@
 (require 'libreka)
 (require 'cl-lib)
 (require 'seq)
+(require 'tab-bar)
 
 (defgroup reka nil
   "Reka - Emacs swimming in the river"
@@ -42,6 +43,52 @@
 
 (defvar-local reka-app-id nil)
 
+(defvar reka--last-focused nil)
+(defvar reka-intercept-prefixes)
+
+(defvar reka--focused-floating-buffer nil
+  "Native-focused floating buffer, which has no reserved Emacs tile.")
+
+(defvar reka--adjusting-floating-layout nil)
+(defvar-local reka--floating-tab nil)
+(defvar-local reka-parent-window nil)
+
+(defvar-local reka-floating nil
+  "Non-nil when this buffer's native window is floating.")
+
+(defvar-local reka-floating-geometry nil
+  "Last native window geometry as (X Y WIDTH HEIGHT), in logical pixels.
+Coordinates are relative to the usable area of `reka-floating-frame-name'.")
+
+(defvar-local reka-floating-frame-name nil
+  "Name of the Emacs frame displaying this native window.")
+
+(defcustom reka-window-created-hook nil
+  "Hook run in a newly created reka buffer."
+  :type 'hook)
+
+(defcustom reka-window-geometry-change-hook nil
+  "Hook run in a reka buffer after its native geometry changes."
+  :type 'hook)
+
+(defcustom reka-floating-state-change-hook nil
+  "Hook run in a reka buffer when its native floating state changes."
+  :type 'hook)
+
+(defcustom reka-floating-default-size '(640 . 480)
+  "Initial width and height of manually floated windows, in logical pixels.
+Dialog windows initially use their client's natural dimensions."
+  :type '(cons integer integer))
+
+(defcustom reka-floating-step 32
+  "Number of logical pixels moved or resized by floating keyboard commands."
+  :type 'integer)
+
+(defcustom reka-floating-toggle-key "s-f"
+  "Global key for toggling the focused native window's floating state.
+Set to nil to register no default; `reka-floating-toggle' remains available."
+  :type '(choice (const nil) key-sequence))
+
 (defun reka--make-buffer-name (app-id title)
   (let ((title-trunc (if (> (length title) 40)
                          (format "%s…" (substring title 0 40))
@@ -54,31 +101,48 @@
 
   (with-mutex reka-processing-commands
     (setq reka--last-focused nil)
-    (let ((params (reka--all-window-parameters)))
-      (reka-update-window-parameters reka-handle params))
-
     (while-let ((cmd (reka-get-next-command reka-handle)))
       (pcase cmd
         (`(key-event . ,key)
          (push (cons t key) unread-command-events))
 
-        (`(new-window . ,window)
-         (reka--create-buffer window)
+        (`(new-window ,window ,floating ,parent)
+         (reka--create-buffer window floating parent)
          (reka-notify-buffer-created reka-handle window))
 
         (`(window-closed . ,window)
          (when-let* ((buf (reka--find-buffer-for-window window)))
            (kill-buffer buf)))
 
+        (`(window-geometry ,window ,floating ,frame-name ,x ,y ,w ,h)
+         (when-let* ((buf (reka--find-buffer-for-window window)))
+           (reka--apply-window-geometry buf floating frame-name (list x y w h))))
+
+        (`(parent-changed ,window ,parent)
+         (when-let* ((buf (reka--find-buffer-for-window window)))
+           (with-current-buffer buf
+             (setq reka-parent-window parent)
+             (reka--inherit-parent-location))))
+
+        (`(frame-focused . ,_frame-name)
+         (setq reka--focused-floating-buffer nil))
+
         (`(minimize-requested . ,window)
          (when-let* ((buf (reka--find-buffer-for-window window)))
            (with-current-buffer buf
-             (bury-buffer))))
+             (if reka-floating
+                 (setq reka--floating-tab nil)
+               (bury-buffer)))
+           (when (eq buf reka--focused-floating-buffer)
+             (setq reka--focused-floating-buffer nil))))
 
         (`(focused . ,window)
-         (when-let* ((buf (reka--find-buffer-for-window window))
-                     (win (get-buffer-window buf t)))
-           (select-window win 'norecord)))
+         (when-let* ((buf (reka--find-buffer-for-window window)))
+           (if (buffer-local-value 'reka-floating buf)
+               (setq reka--focused-floating-buffer buf)
+             (setq reka--focused-floating-buffer nil)
+             (when-let* ((win (get-buffer-window buf t)))
+               (select-window win 'norecord)))))
 
         (`(app-id-change ,window ,app-id)
          (when-let* ((buf (reka--find-buffer-for-window window)))
@@ -102,6 +166,9 @@
 
         (_ (error "received unknown command from reka: %s" cmd))))
 
+    ;; Publish after creating buffers: detached dialogs do not change Emacs'
+    ;; window layout and therefore do not trigger its configuration hook.
+    (reka-update-window-parameters reka-handle (reka--all-window-parameters))
     (run-at-time nil nil #'reka--update-focus-request)))
 
 (defun reka--handle-event (&rest _) ;; unused process filter args
@@ -113,6 +180,8 @@
   "Window object for this reka-mode buffer.")
 
 (defun reka--buffer-killed ()
+  (when (eq (current-buffer) reka--focused-floating-buffer)
+    (setq reka--focused-floating-buffer nil))
   (when reka-window
     (reka-close-window reka-handle reka-window)))
 
@@ -125,6 +194,96 @@
   (setq-local left-fringe-width 0
               right-fringe-width 0))
 
+(defun reka--active-application-buffer ()
+  "Return the native-focused floating buffer or the current tiled application."
+  (cond
+   ((and (buffer-live-p reka--focused-floating-buffer)
+         (reka--floating-visible-p reka--focused-floating-buffer))
+    reka--focused-floating-buffer)
+   ((derived-mode-p 'reka-mode) (current-buffer))))
+
+(defun reka--require-window ()
+  "Return the active native window, or signal an interactive error."
+  (let ((buffer (reka--active-application-buffer)))
+    (unless (and reka-handle buffer
+                 (buffer-local-value 'reka-window buffer))
+      (user-error "There is no active Reka application window"))
+    (buffer-local-value 'reka-window buffer)))
+
+(defun reka-floating-toggle ()
+  "Toggle this buffer's native window between tiled and floating placement."
+  (interactive)
+  (reka-toggle-window-floating reka-handle (reka--require-window)))
+
+(defun reka-floating-center ()
+  "Float and center this window over its parent or the current output."
+  (interactive)
+  (reka-center-floating-window reka-handle (reka--require-window)))
+
+(defun reka-floating-move (dx dy)
+  "Float and move this window by DX and DY logical pixels."
+  (interactive "nHorizontal displacement: \nnVertical displacement: ")
+  (reka-move-floating-window reka-handle (reka--require-window) dx dy))
+
+(defun reka-floating-resize (dw dh)
+  "Float and resize this window by DW and DH logical pixels."
+  (interactive "nWidth change: \nnHeight change: ")
+  (reka-resize-floating-window reka-handle (reka--require-window) dw dh))
+
+(defun reka-floating-move-left ()
+  (interactive)
+  (reka-floating-move (- reka-floating-step) 0))
+
+(defun reka-floating-move-right ()
+  (interactive)
+  (reka-floating-move reka-floating-step 0))
+
+(defun reka-floating-move-up ()
+  (interactive)
+  (reka-floating-move 0 (- reka-floating-step)))
+
+(defun reka-floating-move-down ()
+  (interactive)
+  (reka-floating-move 0 reka-floating-step))
+
+(defun reka-floating-shrink-width ()
+  (interactive)
+  (reka-floating-resize (- reka-floating-step) 0))
+
+(defun reka-floating-grow-width ()
+  (interactive)
+  (reka-floating-resize reka-floating-step 0))
+
+(defun reka-floating-shrink-height ()
+  (interactive)
+  (reka-floating-resize 0 (- reka-floating-step)))
+
+(defun reka-floating-grow-height ()
+  (interactive)
+  (reka-floating-resize 0 reka-floating-step))
+
+(defvar-keymap reka-floating-map
+  :doc "Floating window commands, available under C-x w in reka buffers."
+  "f" #'reka-floating-toggle
+  "c" #'reka-floating-center
+  "<left>" #'reka-floating-move-left
+  "<right>" #'reka-floating-move-right
+  "<up>" #'reka-floating-move-up
+  "<down>" #'reka-floating-move-down
+  "S-<left>" #'reka-floating-shrink-width
+  "S-<right>" #'reka-floating-grow-width
+  "S-<up>" #'reka-floating-shrink-height
+  "S-<down>" #'reka-floating-grow-height)
+
+(define-key reka-mode-map (kbd "C-x w") reka-floating-map)
+
+(defvar-keymap reka-floating-command-map
+  :doc "Floating commands while a detached native application is focused."
+  "C-x w" reka-floating-map)
+
+(defvar reka--floating-emulation-map-alist
+  `((reka--focused-floating-buffer . ,reka-floating-command-map)))
+
 (defun reka--is-reka-buffer (buf)
   (with-current-buffer buf
     (eq major-mode 'reka-mode)))
@@ -136,7 +295,7 @@
   (apply #'vector (seq-filter #'reka--is-reka-buffer (buffer-list))))
 
 (defun reka--window-parameters (frame window)
-  (let ((edges (window-inside-absolute-pixel-edges window)))
+  (let ((edges (window-inside-pixel-edges window)))
     (reka-make-window-parameters
      (buffer-local-value 'reka-window (window-buffer window))
      frame
@@ -145,36 +304,139 @@
      (- (nth 2 edges) (nth 0 edges))
      (- (nth 3 edges) (nth 1 edges)))))
 
-(defun reka--all-window-parameters ()
-  (let ((windows-by-frame
-         (cl-loop for frame being the frames
-                  collect (cons (frame-parameter frame 'name)
-                                (seq-filter (lambda (window)
-                                              (reka--is-reka-buffer (window-buffer window)))
-                                            (window-list frame))))))
-    (apply #'vector
-           (seq-map (lambda (elem)
-                      (let ((frame-name (car elem))
-                            (windows (cdr elem)))
-                        (apply #'vector
-                               (seq-map (lambda (w) (reka--window-parameters frame-name w))
-                                        windows))))
-                    windows-by-frame))))
+(defun reka--frame-by-name (name)
+  (seq-find (lambda (frame) (equal name (frame-parameter frame 'name)))
+            (frame-list)))
 
-(defun reka--create-buffer (window)
+(defun reka--current-tab-id (&optional frame)
+  "Return a stable private ID for the current tab of FRAME."
+  (let* ((frame (or frame (selected-frame)))
+         (tab (tab-bar--current-tab-find nil frame)))
+    (or (alist-get 'reka-id tab)
+        (setf (alist-get 'reka-id (cdr tab)) (gensym "reka-tab-")))))
+
+(defun reka--inherit-parent-location ()
+  "Adopt a native parent's frame/tab without allocating an Emacs window."
+  (when-let* ((parent reka-parent-window)
+              (buffer (reka--find-buffer-for-window parent)))
+    (let* ((window (get-buffer-window buffer t))
+           (frame (when window (window-frame window))))
+      (setq reka-floating-frame-name
+            (or (buffer-local-value 'reka-floating-frame-name buffer)
+                (and frame (frame-parameter frame 'name))
+                reka-floating-frame-name)
+            reka--floating-tab
+            (or (buffer-local-value 'reka--floating-tab buffer)
+                (and frame (reka--current-tab-id frame))
+                reka--floating-tab)))))
+
+(defun reka--new-tab (tab)
+  "Give a newly created TAB its own floating-window membership."
+  (setf (alist-get 'reka-id (cdr tab)) (gensym "reka-tab-"))
+  (setq reka--focused-floating-buffer nil)
+  (reka--handle-event))
+
+(defun reka--tab-selected (&rest _)
+  (setq reka--focused-floating-buffer nil)
+  (reka--handle-event))
+
+(defun reka--floating-visible-p (buffer)
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when-let* ((frame (and reka-floating
+                             (reka--frame-by-name reka-floating-frame-name))))
+        (eq reka--floating-tab (reka--current-tab-id frame))))))
+
+(defun reka--detach-floating-buffer (buffer)
+  "Remove BUFFER's tiled slots while preserving its native frame and tab."
+  (let ((reka--adjusting-floating-layout t))
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (when (window-live-p window)
+        (let ((frame (window-frame window)))
+          (with-current-buffer buffer
+            (setq reka-floating-frame-name (frame-parameter frame 'name)
+                  reka--floating-tab (reka--current-tab-id frame))))
+        (if (window-parent window)
+            (delete-window window)
+          (switch-to-prev-buffer window 'bury)
+          (when (with-current-buffer (window-buffer window)
+                  (and (derived-mode-p 'reka-mode) reka-floating))
+            (set-window-buffer window (get-buffer-create "*reka-background*")))))))
+  (with-current-buffer buffer
+    (reka--inherit-parent-location))
+  (setq reka--focused-floating-buffer buffer))
+
+(defun reka--apply-window-geometry (buffer floating frame-name geometry)
+  "Apply native placement metadata without reserving an Emacs tile for floats."
+  (with-current-buffer buffer
+    (let ((changed (not (eq reka-floating floating)))
+          (reka--adjusting-floating-layout t))
+      (setq reka-floating floating
+            reka-floating-geometry geometry
+            reka-floating-frame-name frame-name)
+      (if floating
+          (progn
+            (unless reka--floating-tab
+              (when-let* ((frame (reka--frame-by-name frame-name)))
+                (setq reka--floating-tab (reka--current-tab-id frame))))
+            (when changed (reka--detach-floating-buffer buffer))
+            (reka--inherit-parent-location))
+        (when-let* ((frame (reka--frame-by-name frame-name)))
+          (setq reka--floating-tab (reka--current-tab-id frame))
+          (when changed
+            (when (eq buffer reka--focused-floating-buffer)
+              (setq reka--focused-floating-buffer nil))
+            (with-selected-frame frame
+              (when-let* ((window (display-buffer buffer)))
+                (select-window window 'norecord))))))
+      (when changed (run-hooks 'reka-floating-state-change-hook))
+      (run-hooks 'reka-window-geometry-change-hook))))
+
+(defun reka--all-window-parameters ()
+  "Collect tiled rectangles and visible detached floats for the native manager."
+  (apply #'vector
+         (cl-loop for frame being the frames
+                  for frame-name = (frame-parameter frame 'name)
+                  collect
+                  (apply #'vector
+                         (append
+                          (cl-loop for window in (window-list frame)
+                                   for buffer = (window-buffer window)
+                                   when (and (reka--is-reka-buffer buffer)
+                                             (not (buffer-local-value 'reka-floating buffer)))
+                                   collect (reka--window-parameters frame-name window))
+                          (cl-loop for buffer across (reka--list-buffers)
+                                   when (and (reka--floating-visible-p buffer)
+                                             (equal frame-name (buffer-local-value 'reka-floating-frame-name buffer)))
+                                   collect
+                                   (with-current-buffer buffer
+                                     (let ((geometry (or reka-floating-geometry
+                                                         (list 0 0 (car reka-floating-default-size)
+                                                               (cdr reka-floating-default-size)))))
+                                       (apply #'reka-make-window-parameters
+                                              reka-window frame-name geometry)))))))))
+
+(defun reka--create-buffer (window &optional floating parent)
   (let ((buffer (get-buffer-create (make-temp-name "reka-window-"))))
     (with-current-buffer buffer
       (reka-mode)
-      (setq-local reka-window window))
-    (display-buffer buffer)))
-
-(defvar reka--last-focused nil)
+      (setq-local reka-window window
+                  reka-floating floating
+                  reka-parent-window parent
+                  reka-floating-frame-name (frame-parameter nil 'name)
+                  reka--floating-tab (reka--current-tab-id))
+      (reka--inherit-parent-location)
+      (run-hooks 'reka-window-created-hook))
+    (if floating
+        (setq reka--focused-floating-buffer buffer)
+      (display-buffer buffer))
+    buffer))
 
 (defun reka--update-focus-request (&rest _) ;; TODO: take & forward frame for active output logic
   "Send a focus request to the WM reflecting the current selected-window."
   (when reka-handle
     (let* ((win (selected-window))
-           (buf (window-buffer win))
+           (buf (or (reka--active-application-buffer) (window-buffer win)))
            ;; collection of conditions for "no interactive command in progress"
            ;; this is based on what which-key does + whacking moles as bugs show up
            (can-focus-window (and (reka--is-reka-buffer buf) ;; only focus wayland surfaces
@@ -183,11 +445,19 @@
                                   (= 0 (length (this-single-command-keys))) ;; no unfinished command sequence
                                   (= 0 (minibuffer-depth)) ;; no minibuffer editing active
                                   (= 0 (recursion-depth))))) ;; no recursive edit ongoing
-      (unless (equal buf reka--last-focused)
-        (setq reka--last-focused buf)
+      (unless (equal (cons buf can-focus-window) reka--last-focused)
+        (setq reka--last-focused (cons buf can-focus-window))
         (reka-set-focus-request reka-handle
                                 (when can-focus-window
                                   (buffer-local-value 'reka-window buf)))))))
+
+(defun reka--selection-changed (&rest arguments)
+  "Track an explicit Emacs selection separately from native floating focus."
+  (unless reka--adjusting-floating-layout
+    (setq reka--focused-floating-buffer nil)
+    (when (and (derived-mode-p 'reka-mode) reka-floating)
+      (reka--detach-floating-buffer (current-buffer))))
+  (apply #'reka--update-focus-request arguments))
 
 (defconst reka--modifier-bits
   ;; TODO: can we handle this with XKB on the rust side, too?
@@ -214,7 +484,7 @@ binding, meaning that it is always forwarded to Emacs. Use this in
 combination with `global-set-key' to define global key bindings that are
 always sent to Emacs.
 
-Can optionally set COMMAND to one of: `toggle-fullscreen'" ;; sic, only one
+COMMAND can be `toggle-fullscreen' or `toggle-floating' for native actions."
   (let ((data (reka--key-to-xkb prefix)))
     (reka-register-xkb-prefix reka-handle (if (integerp (car data))
                                               (car data)
@@ -243,7 +513,8 @@ Can optionally set COMMAND to one of: `toggle-fullscreen'" ;; sic, only one
 (defun reka--buffer-predicate (buffer)
   "Buffer predicate to avoid accidentally showing the same reka buffer twice."
   (or (not (with-current-buffer buffer (derived-mode-p 'reka-mode)))
-      (not (get-buffer-window buffer t))))
+      (and (not (buffer-local-value 'reka-floating buffer))
+           (not (get-buffer-window buffer t)))))
 
 (defun reka--split-window-advice (new-window)
   "Advice window splits to always display another buffer, if a reka buffer
@@ -292,13 +563,21 @@ starting Emacs inside of river."
                                  :noquery t)))
     (setq reka-handle (reka-start-wm pipe)))
   (reka-push-intercept-prefixes)
+  (add-to-list 'emulation-mode-map-alists 'reka--floating-emulation-map-alist)
+  (reka-configure-floating reka-handle
+                           (car reka-floating-default-size)
+                           (cdr reka-floating-default-size))
+  (when reka-floating-toggle-key
+    (reka-push-intercept-prefix reka-floating-toggle-key 'toggle-floating))
 
   ;; Layout signals
+  (add-hook 'tab-bar-tab-post-open-functions #'reka--new-tab)
+  (add-hook 'tab-bar-tab-post-select-functions #'reka--tab-selected)
   (add-hook 'window-configuration-change-hook #'reka--handle-event)
 
   ;; Focus signals
-  (add-hook 'window-selection-change-functions #'reka--update-focus-request)
-  (add-hook 'window-buffer-change-functions    #'reka--update-focus-request)
+  (add-hook 'window-selection-change-functions #'reka--selection-changed)
+  (add-hook 'window-buffer-change-functions    #'reka--selection-changed)
   (add-hook 'minibuffer-setup-hook             #'reka--update-focus-request)
   (add-hook 'minibuffer-exit-hook              #'reka--update-focus-request)
   (add-hook 'post-command-hook                 #'reka--update-focus-request)

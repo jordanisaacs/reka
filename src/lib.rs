@@ -15,6 +15,9 @@ use nix::sys::eventfd::{EfdFlags, EventFd};
 use wayland_client::{Connection, Dispatch, protocol::wl_registry};
 use xkbcommon::xkb;
 
+mod floating;
+use floating::{Placement, Rect, ResizeEdges, SizeHints, StackEntry, stacking_order};
+
 use crate::river::{
     river_layer_shell_output_v1::RiverLayerShellOutputV1,
     river_layer_shell_seat_v1::RiverLayerShellSeatV1,
@@ -73,6 +76,10 @@ use_symbols!(
     frame_request
     discard_frame
     toggle_fullscreen
+    toggle_floating
+    window_geometry
+    parent_changed
+    frame_focused
     message
     reka_get_window => "reka--get-window"
     reka_create_buffer => "reka--create-buffer"
@@ -137,6 +144,7 @@ enum Command {
 
     /// Toggle fullscreen for the selected window
     ToggleFullscreen,
+    ToggleFloating,
 }
 
 fn command_from_lisp<'e>(command: Value<'e>, event: KeyEvent) -> Result<Command> {
@@ -144,11 +152,23 @@ fn command_from_lisp<'e>(command: Value<'e>, event: KeyEvent) -> Result<Command>
         if toggle_fullscreen.eq(&command) {
             return Ok(Command::ToggleFullscreen);
         }
+        if toggle_floating.eq(&command) {
+            return Ok(Command::ToggleFloating);
+        }
 
         return Err(anyhow!("unknown builtin command"));
     }
 
-    return Ok(Command::Forward(event));
+    Ok(Command::Forward(event))
+}
+
+#[derive(Debug)]
+enum FloatingCommand {
+    Toggle,
+    Set(bool),
+    Move(i32, i32),
+    Resize(i32, i32),
+    Center,
 }
 
 #[derive(Debug)]
@@ -160,17 +180,22 @@ enum FromEmacs {
     CloseWindow(RiverWindowV1),
     BufferCreated(RiverWindowV1),
     UpdateParameters(HashMap<RiverWindowV1, WindowParameters>),
+    Floating(RiverWindowV1, FloatingCommand),
+    FloatingDefaultSize(i32, i32),
 }
 
 #[derive(Debug)]
 enum ToEmacs {
     KeyEvent(KeyEvent),
-    NewWindow(RiverWindowV1),
+    NewWindow(RiverWindowV1, bool, Option<RiverWindowV1>),
     WindowClosed(RiverWindowV1),
+    ParentChanged(RiverWindowV1, Option<RiverWindowV1>),
+    FrameFocused(String),
     Focused(RiverWindowV1),
     TitleChange(RiverWindowV1, String),
     AppIDChange(RiverWindowV1, String),
     MinimizeRequested(RiverWindowV1),
+    WindowGeometry(RiverWindowV1, bool, String, Rect),
     RequestFrame,
     DiscardFrame(String),
     Message(String),
@@ -180,7 +205,21 @@ impl<'e> IntoLisp<'e> for ToEmacs {
     fn into_lisp(self, env: &'e Env) -> Result<Value<'e>> {
         match self {
             ToEmacs::KeyEvent(event) => env.cons(key_event, event),
-            ToEmacs::NewWindow(win) => env.call(cons, (new_window, RefCell::new(win))),
+            ToEmacs::NewWindow(win, floating, parent) => {
+                let parent = match parent {
+                    Some(parent) => RefCell::new(parent).into_lisp(env)?,
+                    None => ().into_lisp(env)?,
+                };
+                env.call(list, (new_window, RefCell::new(win), floating, parent))
+            }
+            ToEmacs::ParentChanged(win, parent) => {
+                let parent = match parent {
+                    Some(parent) => RefCell::new(parent).into_lisp(env)?,
+                    None => ().into_lisp(env)?,
+                };
+                env.call(list, (parent_changed, RefCell::new(win), parent))
+            }
+            ToEmacs::FrameFocused(name) => env.cons(frame_focused, name),
             ToEmacs::WindowClosed(win) => env.call(cons, (window_closed, RefCell::new(win))),
             ToEmacs::MinimizeRequested(win) => env.cons(minimize_requested, RefCell::new(win)),
             ToEmacs::Focused(win) => env.call(cons, (focused, RefCell::new(win))),
@@ -190,6 +229,19 @@ impl<'e> IntoLisp<'e> for ToEmacs {
             ToEmacs::TitleChange(win, title) => {
                 env.call(list, (title_change, RefCell::new(win), title))
             }
+            ToEmacs::WindowGeometry(window, floating, frame_name, rect) => env.call(
+                list,
+                (
+                    window_geometry,
+                    RefCell::new(window),
+                    floating,
+                    frame_name,
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                ),
+            ),
             ToEmacs::RequestFrame => frame_request.into_lisp(env),
             ToEmacs::DiscardFrame(frame_name) => env.call(cons, (discard_frame, frame_name)),
             ToEmacs::Message(text) => env.cons(message, text),
@@ -274,6 +326,90 @@ fn inject_key_sequence<'e>(
     ().into_lisp(env)
 }
 
+/// Set whether WINDOW floats independently of its Emacs layout rectangle.
+#[defun]
+fn set_window_floating<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+    floating: Value<'e>,
+) -> Result<Value<'e>> {
+    handle.send(FromEmacs::Floating(
+        window.clone(),
+        FloatingCommand::Set(floating.is_not_nil()),
+    ))?;
+    ().into_lisp(env)
+}
+
+/// Toggle WINDOW between tiled and floating placement.
+#[defun]
+fn toggle_window_floating<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+) -> Result<Value<'e>> {
+    handle.send(FromEmacs::Floating(window.clone(), FloatingCommand::Toggle))?;
+    ().into_lisp(env)
+}
+
+/// Move a floating WINDOW by DX/DY logical pixels, keeping it in the work area.
+#[defun]
+fn move_floating_window<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+    dx: i32,
+    dy: i32,
+) -> Result<Value<'e>> {
+    handle.send(FromEmacs::Floating(
+        window.clone(),
+        FloatingCommand::Move(dx, dy),
+    ))?;
+    ().into_lisp(env)
+}
+
+/// Resize a floating WINDOW by DW/DH logical pixels, respecting client hints.
+#[defun]
+fn resize_floating_window<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+    dw: i32,
+    dh: i32,
+) -> Result<Value<'e>> {
+    handle.send(FromEmacs::Floating(
+        window.clone(),
+        FloatingCommand::Resize(dw, dh),
+    ))?;
+    ().into_lisp(env)
+}
+
+/// Center WINDOW over its parent, or over its output's usable area.
+#[defun]
+fn center_floating_window<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+) -> Result<Value<'e>> {
+    handle.send(FromEmacs::Floating(window.clone(), FloatingCommand::Center))?;
+    ().into_lisp(env)
+}
+
+/// Configure the initial size of manually floated windows.
+#[defun]
+fn configure_floating<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    width: i32,
+    height: i32,
+) -> Result<Value<'e>> {
+    if width <= 0 || height <= 0 {
+        bail!("floating window dimensions must be positive");
+    }
+    handle.send(FromEmacs::FloatingDefaultSize(width, height))?;
+    ().into_lisp(env)
+}
+
 type EmacsChannel = Box<dyn std::io::Write>;
 
 /// Start the reka window manager process. This should not be called manually,
@@ -320,8 +456,8 @@ struct WindowParameters {
 /// and dimensions for a given Wayland surface. This is an internal reka
 /// function.
 #[defun(user_ptr)]
-fn make_window_parameters<'e>(
-    _env: &'e Env,
+fn make_window_parameters(
+    _env: &Env,
     window: &RiverWindowV1,
     frame_name: String,
     x: i32,
@@ -424,7 +560,7 @@ fn register_xkb_prefix<'e>(
     };
 
     if keysym == xkb::keysyms::KEY_NoSymbol.into() {
-        return Err(anyhow!("could not resolve XKB keysym for key").into());
+        return Err(anyhow!("could not resolve XKB keysym for key"));
     }
 
     let modifiers = Modifiers::from_bits(modifiers_bits).context("unknown modifier bits")?;
@@ -490,6 +626,11 @@ fn wm_loop(
         prefixes: Default::default(),
         pending_frames: 0,
         virtual_keyboard: virtual_keyboard::VirtualKeyboard::new(keyboard_ready),
+        float_size: (640, 480),
+        stacking_serial: 0,
+        pointer_window: None,
+        pointer_operation: None,
+        pointer_bindings: Vec::new(),
     };
     let _registry = display.get_registry(&qh, ());
 
@@ -608,6 +749,12 @@ struct Window {
     state: WindowState,
     params: Option<WindowParameters>,
     actual_width_height: Option<(i32, i32)>,
+    placement: Placement,
+    parent: Option<RiverWindowV1>,
+    hints: SizeHints,
+    stacking_order: u64,
+    reported_geometry: Option<(bool, String, Rect)>,
+    announced: bool,
 }
 
 impl Drop for Window {
@@ -615,6 +762,42 @@ impl Drop for Window {
         self.proxy.destroy();
         self.node.destroy();
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PointerAction {
+    Move,
+    Resize(ResizeEdges),
+}
+
+struct PointerOperation {
+    window: RiverWindowV1,
+    seat: river::river_seat_v1::RiverSeatV1,
+    action: PointerAction,
+    initial: Rect,
+    started: bool,
+    released: bool,
+}
+
+struct PointerBinding {
+    proxy: river::river_pointer_binding_v1::RiverPointerBindingV1,
+    action: PointerAction,
+    enabled: bool,
+}
+
+impl Drop for PointerBinding {
+    fn drop(&mut self) {
+        self.proxy.destroy();
+    }
+}
+
+#[derive(Clone)]
+struct DisplayPlacement {
+    frame: RiverWindowV1,
+    frame_name: String,
+    output: RiverOutputV1,
+    area: Rect,
+    rect: Rect,
 }
 
 struct Seat {
@@ -744,12 +927,18 @@ struct Reka {
     outputs: HashMap<RiverOutputV1, Output>,
     windows: HashMap<RiverWindowV1, Window>,
     prefixes: HashMap<XKBPrefix, Binding>,
+    float_size: (i32, i32),
+    stacking_serial: u64,
+    pointer_window: Option<RiverWindowV1>,
+    pointer_operation: Option<PointerOperation>,
+    pointer_bindings: Vec<PointerBinding>,
 }
 
 impl Drop for Reka {
     fn drop(&mut self) {
         // Destroy everything else before tearing down the WM objects.
         self.virtual_keyboard.reset();
+        self.pointer_bindings.clear();
         self.prefixes.clear();
         self.windows.clear();
         self.frames.clear();
@@ -780,6 +969,411 @@ impl Reka {
         }
     }
 
+    fn announce_windows(&mut self) {
+        let mut announcements = Vec::new();
+        for window in self.windows.values_mut() {
+            if !window.announced {
+                window.announced = true;
+                announcements.push((
+                    window.stacking_order,
+                    ToEmacs::NewWindow(
+                        window.proxy.clone(),
+                        window.placement.floating(),
+                        window.parent.clone(),
+                    ),
+                ));
+            }
+        }
+        announcements.sort_by_key(|(order, _)| *order);
+        for (_, announcement) in announcements {
+            self.send(announcement);
+        }
+    }
+
+    fn window_is_fullscreen(&self, proxy: &RiverWindowV1) -> bool {
+        self.outputs
+            .values()
+            .any(|output| match &output.fullscreen {
+                FullscreenState::Requested { new, .. } => new == proxy,
+                FullscreenState::Fullscreen(window) => window == proxy,
+                FullscreenState::None | FullscreenState::Exiting(_) => false,
+            })
+    }
+
+    fn display_placement(&self, proxy: &RiverWindowV1) -> Option<DisplayPlacement> {
+        self.display_placement_inner(proxy, 0)
+    }
+
+    fn display_placement_inner(
+        &self,
+        proxy: &RiverWindowV1,
+        depth: usize,
+    ) -> Option<DisplayPlacement> {
+        // River guarantees an acyclic parent tree; also bound traversal locally.
+        if depth > self.windows.len() {
+            return None;
+        }
+        let window = self.windows.get(proxy)?;
+        if window.state != WindowState::Active || window.params.is_none() {
+            return None;
+        }
+        let mut display = if let Some(parent) = &window.parent {
+            if self.windows.contains_key(parent) {
+                self.display_placement_inner(parent, depth + 1)?
+            } else {
+                let frame = self.frames.get(parent)?;
+                let output_proxy = frame.displayed_on.as_ref()?;
+                let output = self.outputs.get(output_proxy)?;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    w: output.width.max(1),
+                    h: output.height.max(1),
+                };
+                DisplayPlacement {
+                    frame: parent.clone(),
+                    frame_name: frame.name.clone()?,
+                    output: output_proxy.clone(),
+                    area,
+                    rect: area,
+                }
+            }
+        } else {
+            let params = window.params.as_ref()?;
+            let frame = self.frame_by_name(&params.frame_name)?;
+            let output_proxy = frame.displayed_on.as_ref()?;
+            let output = self.outputs.get(output_proxy)?;
+            DisplayPlacement {
+                frame: frame.proxy.clone(),
+                frame_name: params.frame_name.clone(),
+                output: output_proxy.clone(),
+                area: Rect {
+                    x: 0,
+                    y: 0,
+                    w: output.width.max(1),
+                    h: output.height.max(1),
+                },
+                rect: Rect {
+                    x: params.x,
+                    y: params.y,
+                    w: params.w.max(1),
+                    h: params.h.max(1),
+                },
+            }
+        };
+        let tile = window
+            .params
+            .as_ref()
+            .map(|params| Rect {
+                x: params.x,
+                y: params.y,
+                w: params.w.max(1),
+                h: params.h.max(1),
+            })
+            .unwrap_or(display.rect);
+        display.rect = window.placement.geometry(tile);
+        if window.placement.floating() {
+            display.rect = display.rect.fit(display.area, window.hints);
+        }
+        Some(display)
+    }
+
+    fn raise_window(&mut self, proxy: &RiverWindowV1) {
+        let mut root = proxy.clone();
+        for _ in 0..self.windows.len() {
+            let Some(parent) = self
+                .windows
+                .get(&root)
+                .and_then(|window| window.parent.as_ref())
+            else {
+                break;
+            };
+            if !self.windows.contains_key(parent) {
+                break;
+            }
+            root = parent.clone();
+        }
+        let mut family = vec![root];
+        for index in 0..self.windows.len() {
+            if index >= family.len() {
+                break;
+            }
+            let parent = family[index].clone();
+            let mut children: Vec<_> = self
+                .windows
+                .iter()
+                .filter(|(_, window)| window.parent.as_ref() == Some(&parent))
+                .map(|(id, window)| (window.stacking_order, id.clone()))
+                .collect();
+            children.sort_by_key(|(order, _)| *order);
+            family.extend(children.into_iter().map(|(_, id)| id));
+        }
+        for id in family {
+            self.stacking_serial += 1;
+            if let Some(window) = self.windows.get_mut(&id) {
+                window.stacking_order = self.stacking_serial;
+            }
+        }
+    }
+
+    fn center_reference(&self, proxy: &RiverWindowV1, display: &DisplayPlacement) -> Rect {
+        self.windows
+            .get(proxy)
+            .and_then(|window| window.parent.as_ref())
+            .and_then(|parent| self.display_placement(parent))
+            .map(|parent| parent.rect)
+            .unwrap_or(display.area)
+    }
+
+    fn floating_command(&mut self, proxy: &RiverWindowV1, command: FloatingCommand) {
+        let Some(display) = self.display_placement(proxy) else {
+            return;
+        };
+        // Fullscreen owns the current dimensions. Leave the saved float alone.
+        if self.window_is_fullscreen(proxy) {
+            return;
+        }
+        let reference = self.center_reference(proxy, &display);
+        let Some(window) = self.windows.get_mut(proxy) else {
+            return;
+        };
+        let was_floating = window.placement.floating();
+        let should_float = match command {
+            FloatingCommand::Toggle => !was_floating,
+            FloatingCommand::Set(value) => value,
+            _ => true,
+        };
+        window.placement.explicit = Some(should_float);
+        if !should_float {
+            if let Some(operation) = &mut self.pointer_operation
+                && operation.window == *proxy
+            {
+                operation.released = true;
+            }
+            return;
+        }
+        let initial = window.placement.geometry.unwrap_or_else(|| {
+            Rect::centered(
+                self.float_size.0,
+                self.float_size.1,
+                reference,
+                display.area,
+                window.hints,
+            )
+        });
+        window.placement.geometry = Some(match command {
+            FloatingCommand::Move(dx, dy) => initial.moved(dx, dy, display.area, window.hints),
+            FloatingCommand::Resize(dw, dh) => initial.resized(
+                dw,
+                dh,
+                ResizeEdges {
+                    right: true,
+                    bottom: true,
+                    ..Default::default()
+                },
+                display.area,
+                window.hints,
+            ),
+            FloatingCommand::Center => {
+                Rect::centered(initial.w, initial.h, reference, display.area, window.hints)
+            }
+            _ => initial.fit(display.area, window.hints),
+        });
+        self.raise_window(proxy);
+    }
+
+    fn initialize_floating_geometry(&mut self) {
+        // Parents are created before children. Resolve those first so dialogs
+        // center over the parent's actual box rather than an Emacs tile.
+        let mut needs_configure = false;
+        let mut windows: Vec<_> = self
+            .windows
+            .iter()
+            .map(|(proxy, window)| (window.stacking_order, proxy.clone()))
+            .collect();
+        windows.sort_by_key(|(order, _)| *order);
+        for (_, proxy) in windows {
+            if self.window_is_fullscreen(&proxy) {
+                continue;
+            }
+            let Some(display) = self.display_placement(&proxy) else {
+                continue;
+            };
+            let reference = self.center_reference(&proxy, &display);
+            let window = self.windows.get_mut(&proxy).unwrap();
+            if !window.placement.floating() {
+                continue;
+            }
+            if let Some(geometry) = window.placement.geometry {
+                window.placement.geometry = Some(geometry.fit(display.area, window.hints));
+            } else if let Some((width, height)) = window.actual_width_height {
+                window.placement.geometry = Some(Rect::centered(
+                    width,
+                    height,
+                    reference,
+                    display.area,
+                    window.hints,
+                ));
+                if let Some(geometry) = window.placement.geometry {
+                    needs_configure |= (geometry.w, geometry.h) != (width, height);
+                }
+            }
+        }
+        if needs_configure && let Some(manager) = &self.river_wm {
+            manager.manage_dirty();
+        }
+    }
+
+    fn begin_pointer_operation(
+        &mut self,
+        proxy: &RiverWindowV1,
+        seat: river::river_seat_v1::RiverSeatV1,
+        action: PointerAction,
+    ) {
+        if self.pointer_operation.is_some()
+            || self.window_is_fullscreen(proxy)
+            || self.seat.as_ref().map(|current| &current.proxy) != Some(&seat)
+        {
+            return;
+        }
+        self.floating_command(proxy, FloatingCommand::Set(true));
+        let Some(display) = self.display_placement(proxy) else {
+            return;
+        };
+        let Some(window) = self.windows.get(proxy) else {
+            return;
+        };
+        if !window.placement.floating() {
+            return;
+        }
+        self.focus.focus_window(proxy.clone(), display.frame);
+        self.focus.mark_dirty();
+        self.pointer_operation = Some(PointerOperation {
+            window: proxy.clone(),
+            seat,
+            action,
+            initial: display.rect,
+            started: false,
+            released: false,
+        });
+    }
+
+    fn pointer_delta(&mut self, dx: i32, dy: i32) {
+        let Some(operation) = &self.pointer_operation else {
+            return;
+        };
+        if operation.released {
+            return;
+        }
+        let Some(display) = self.display_placement(&operation.window) else {
+            return;
+        };
+        let window = self.windows.get_mut(&operation.window).unwrap();
+        window.placement.geometry = Some(match operation.action {
+            PointerAction::Move => operation.initial.moved(dx, dy, display.area, window.hints),
+            PointerAction::Resize(edges) => {
+                operation
+                    .initial
+                    .resized(dx, dy, edges, display.area, window.hints)
+            }
+        });
+    }
+
+    fn reconcile_pointer_operation(&mut self) {
+        if let Some(operation) = &self.pointer_operation {
+            let valid = self.display_placement(&operation.window).is_some()
+                && self
+                    .windows
+                    .get(&operation.window)
+                    .is_some_and(|window| window.placement.floating())
+                && !self.window_is_fullscreen(&operation.window);
+            if !valid {
+                self.pointer_operation.as_mut().unwrap().released = true;
+            }
+        }
+        if let Some(operation) = &mut self.pointer_operation {
+            if operation.released {
+                if operation.started {
+                    if matches!(operation.action, PointerAction::Resize(_))
+                        && self.windows.contains_key(&operation.window)
+                    {
+                        operation.window.inform_resize_end();
+                    }
+                    operation.seat.op_end();
+                }
+                self.pointer_operation = None;
+            } else if !operation.started {
+                operation.seat.op_start_pointer();
+                if matches!(operation.action, PointerAction::Resize(_)) {
+                    operation.window.inform_resize_start();
+                }
+                operation.started = true;
+            }
+        }
+        for binding in &mut self.pointer_bindings {
+            if !binding.enabled {
+                binding.proxy.enable();
+                binding.enabled = true;
+            }
+        }
+    }
+
+    fn render_windows(&mut self) {
+        self.initialize_floating_geometry();
+        let order = stacking_order(
+            self.windows
+                .iter()
+                .map(|(id, window)| StackEntry {
+                    id: id.clone(),
+                    parent: window.parent.clone(),
+                    floating: window.placement.floating(),
+                    order: window.stacking_order,
+                })
+                .collect(),
+        );
+        let mut notifications = Vec::new();
+        for proxy in order {
+            let Some(display) = self.display_placement(&proxy) else {
+                proxy.hide();
+                continue;
+            };
+            let output = &self.outputs[&display.output];
+            let window = self.windows.get_mut(&proxy).unwrap();
+            proxy.show();
+            window.node.set_position(
+                display.rect.x.saturating_add(output.x),
+                display.rect.y.saturating_add(output.y),
+            );
+            window.node.place_top();
+            if window.placement.floating() {
+                // Retain native decorations, shadows and subsurfaces on floats.
+                proxy.set_clip_box(0, 0, 0, 0);
+            } else {
+                let (width, height) = window
+                    .actual_width_height
+                    .unwrap_or((display.rect.w, display.rect.h));
+                proxy.set_clip_box(0, 0, width, height);
+            }
+            let report = (
+                window.placement.floating(),
+                display.frame_name.clone(),
+                display.rect,
+            );
+            if window.reported_geometry.as_ref() != Some(&report) {
+                window.reported_geometry = Some(report.clone());
+                notifications.push(ToEmacs::WindowGeometry(
+                    proxy.clone(),
+                    report.0,
+                    report.1,
+                    report.2,
+                ));
+            }
+        }
+        for notification in notifications {
+            self.send(notification);
+        }
+    }
+
     fn frame_by_output(&self, output: &RiverOutputV1) -> Option<&Frame> {
         self.frames
             .iter()
@@ -795,16 +1389,14 @@ impl Reka {
     }
 
     fn displaying_frame(&self, window: &RiverWindowV1) -> Option<&Frame> {
-        self.windows
-            .get(window)
-            .and_then(|w| w.params.as_ref())
-            .and_then(|p| self.frame_by_name(&p.frame_name))
+        self.display_placement(window)
+            .and_then(|display| self.frames.get(&display.frame))
     }
 
     fn binding_by_proxy(&self, proxy: &RiverXkbBindingV1) -> Option<(&XKBPrefix, &Binding)> {
         self.prefixes.iter().find(|(_, v)| {
             if let BindingState::Enabled(this) = &v.state {
-                return this.eq(proxy);
+                this.eq(proxy)
             } else {
                 false
             }
@@ -923,31 +1515,42 @@ impl Reka {
 
     // reconcile_windows closes killed windows and removes them from the list
     fn reconcile_windows(&mut self) {
-        for (proxy, w) in self.windows.iter() {
-            match &w.state {
-                WindowState::Killed => {
-                    log::info!("requesting window closure");
-                    proxy.close();
-                }
-                WindowState::Starting => {
-                    log::info!("ignoring starting window");
-                }
+        for (proxy, window) in &self.windows {
+            match window.state {
+                WindowState::Killed => proxy.close(),
+                WindowState::Starting => {}
                 WindowState::Active => {
-                    if let Some(params) = &w.params {
-                        proxy.set_tiled(Edges::all());
-                        proxy.propose_dimensions(params.w, params.h);
+                    proxy.set_capabilities(
+                        river::river_window_v1::Capabilities::from_bits_truncate(4 | 8),
+                    );
+                    if self.window_is_fullscreen(proxy) {
+                        continue;
+                    }
+                    if let Some(display) = self.display_placement(proxy) {
+                        if window.placement.floating() {
+                            proxy.set_tiled(Edges::empty());
+                            proxy.use_csd();
+                            if window.placement.geometry.is_some() {
+                                proxy.propose_dimensions(display.rect.w, display.rect.h);
+                            } else {
+                                // Give new dialogs their natural initial dimensions.
+                                proxy.propose_dimensions(0, 0);
+                            }
+                        } else {
+                            proxy.set_tiled(Edges::all());
+                            proxy.use_ssd();
+                            proxy.propose_dimensions(display.rect.w, display.rect.h);
+                        }
                     }
                 }
             }
         }
-
-        // TODO: force kill at some point
     }
 
     fn reconcile_bindings(&mut self) {
         let mut to_enable = vec![];
         {
-            for (_, v) in self.prefixes.iter_mut() {
+            for v in self.prefixes.values_mut() {
                 if let BindingState::Registered(b) = &v.state {
                     to_enable.push(b.clone());
                     v.state = BindingState::Enabled(b.clone());
@@ -1021,7 +1624,9 @@ impl Reka {
                         log::error!("can not focus window that is not displayed!");
                         continue;
                     };
-                    self.focus.focus_window(window, frame.proxy.clone());
+                    let frame = frame.proxy.clone();
+                    self.raise_window(&window);
+                    self.focus.focus_window(window, frame);
                 }
                 FromEmacs::FocusFrame => {
                     // TODO: explicit selection?
@@ -1039,6 +1644,13 @@ impl Reka {
                         needs_manage = true;
                         w.state = WindowState::Active;
                     }
+                }
+                FromEmacs::Floating(proxy, command) => {
+                    self.floating_command(&proxy, command);
+                    needs_manage = true;
+                }
+                FromEmacs::FloatingDefaultSize(width, height) => {
+                    self.float_size = (width, height);
                 }
                 FromEmacs::UpdateParameters(mut new_params) => {
                     for (proxy, w) in self.windows.iter_mut() {
@@ -1068,17 +1680,18 @@ impl Reka {
             })
             .collect::<Vec<_>>();
 
-        if !register_prefixes.is_empty() && self.xkb_bindings.is_some() && self.seat.is_some() {
-            let xkb = self.xkb_bindings.as_ref().unwrap();
-            let seat = self.seat.as_ref().unwrap().proxy.clone();
+        if !register_prefixes.is_empty()
+            && let (Some(xkb), Some(seat)) = (&self.xkb_bindings, &self.seat)
+        {
+            let seat = seat.proxy.clone();
             let mut bindings = vec![];
 
             for p in &register_prefixes {
-                let b = xkb.get_xkb_binding(&seat, p.keysym, p.modifiers, &qh, ());
+                let b = xkb.get_xkb_binding(&seat, p.keysym, p.modifiers, qh, ());
                 bindings.push(b);
             }
 
-            for (p, b) in register_prefixes.into_iter().zip(bindings.into_iter()) {
+            for (p, b) in register_prefixes.into_iter().zip(bindings) {
                 let binding = self
                     .prefixes
                     .get_mut(&p)
@@ -1143,7 +1756,9 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
             river::river_window_manager_v1::Event::ManageStart => {
                 log::debug!("manage sequence started");
 
+                state.announce_windows();
                 state.reconcile_frames();
+                state.reconcile_pointer_operation();
                 state.reconcile_windows();
                 state.reconcile_bindings();
                 state.reconcile_fullscreen();
@@ -1174,37 +1789,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
                     }
                 }
 
-                for (win_proxy, window) in state.windows.iter() {
-                    if let WindowState::Active = window.state {
-                        if let Some(params) = &window.params {
-                            // look up frame-relative output coordinates, but
-                            // hide the window if no output is found (this
-                            // occurs after outputs are disconnected but frames
-                            // on them have remaining alive window parameters)
-                            let output = state
-                                .frame_by_name(&params.frame_name)
-                                .and_then(|f| f.displayed_on.as_ref())
-                                .and_then(|op| state.outputs.get(op));
-
-                            if let Some(output) = output {
-                                win_proxy.show();
-                                window
-                                    .node
-                                    .set_position(params.x + output.x, params.y + output.y);
-                                window.node.place_top();
-
-                                // clip to actual content size, to get rid of unwanted decorations
-                                let (clip_w, clip_h) =
-                                    window.actual_width_height.unwrap_or((params.w, params.h));
-                                win_proxy.set_clip_box(0, 0, clip_w, clip_h);
-                            } else {
-                                win_proxy.hide();
-                            }
-                        } else {
-                            win_proxy.hide();
-                        }
-                    }
-                }
+                state.render_windows();
 
                 proxy.render_finish();
             }
@@ -1215,7 +1800,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
                     .layer_shell
                     .as_ref()
                     .expect("layer shell not registered")
-                    .get_output(&id, &qhandle, ());
+                    .get_output(&id, qhandle, ());
 
                 state.outputs.insert(
                     id.clone(),
@@ -1239,6 +1824,32 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
                     .expect("layer shell not bound")
                     .get_seat(&id, qhandle, ());
                 if state.seat.is_none() {
+                    let move_binding = id.get_pointer_binding(
+                        0x110,
+                        Modifiers::from_bits_truncate(64),
+                        qhandle,
+                        (),
+                    );
+                    let resize_binding = id.get_pointer_binding(
+                        0x111,
+                        Modifiers::from_bits_truncate(64),
+                        qhandle,
+                        (),
+                    );
+                    state.pointer_bindings.push(PointerBinding {
+                        proxy: move_binding,
+                        action: PointerAction::Move,
+                        enabled: false,
+                    });
+                    state.pointer_bindings.push(PointerBinding {
+                        proxy: resize_binding,
+                        action: PointerAction::Resize(ResizeEdges {
+                            right: true,
+                            bottom: true,
+                            ..Default::default()
+                        }),
+                        enabled: false,
+                    });
                     state.seat = Some(Seat { proxy: id, ls_seat });
                 } else {
                     log::error!(
@@ -1394,20 +2005,44 @@ impl Dispatch<river::river_seat_v1::RiverSeatV1, ()> for Reka {
             }
             _ => {}
         }
-        if let river::river_seat_v1::Event::WindowInteraction { window } = event {
-            log::debug!("window interaction, setting focus: {:?}", window);
-            if state.frames.contains_key(&window) {
-                state.focus.focus_frame(window);
-                return;
+        match event {
+            river::river_seat_v1::Event::WindowInteraction { window } => {
+                if let Some(frame) = state.frames.get(&window) {
+                    if let Some(name) = &frame.name {
+                        state.send(ToEmacs::FrameFocused(name.clone()));
+                    }
+                    state.focus.focus_frame(window);
+                    return;
+                }
+                let Some(frame) = state
+                    .displaying_frame(&window)
+                    .map(|frame| frame.proxy.clone())
+                else {
+                    return;
+                };
+                state.raise_window(&window);
+                state.focus.focus_window(window, frame);
+                state.focus.mark_dirty();
             }
-
-            let Some(frame) = state.displaying_frame(&window) else {
-                log::error!("received window interaction for window without a frame");
-                return;
-            };
-
-            state.focus.focus_window(window, frame.proxy.clone());
-            state.focus.mark_dirty();
+            river::river_seat_v1::Event::PointerEnter { window } => {
+                state.pointer_window = Some(window);
+            }
+            river::river_seat_v1::Event::PointerLeave => {
+                state.pointer_window = None;
+            }
+            river::river_seat_v1::Event::OpDelta { dx, dy } => state.pointer_delta(dx, dy),
+            river::river_seat_v1::Event::OpRelease => {
+                if let Some(operation) = &mut state.pointer_operation {
+                    operation.released = true;
+                }
+            }
+            river::river_seat_v1::Event::Removed => {
+                state.pointer_operation = None;
+                state.pointer_window = None;
+                state.pointer_bindings.clear();
+                state.seat = None;
+            }
+            _ => {}
         }
     }
 }
@@ -1449,8 +2084,7 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                 }
 
                 log::info!("discovered new window (PID: {}) ...", unreliable_pid);
-                state.send(ToEmacs::NewWindow(proxy.clone()));
-
+                state.stacking_serial += 1;
                 state.windows.insert(
                     proxy.clone(),
                     Window {
@@ -1459,6 +2093,12 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                         state: WindowState::Starting,
                         params: None,
                         actual_width_height: None,
+                        placement: Placement::default(),
+                        parent: None,
+                        hints: SizeHints::default(),
+                        stacking_order: state.stacking_serial,
+                        reported_geometry: None,
+                        announced: false,
                     },
                 );
             }
@@ -1476,16 +2116,72 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                     return;
                 }
 
-                if title.starts_with("reka-frame-") {
-                    if let Some(f) = state.frames.get_mut(proxy) {
-                        f.name = Some(title);
-                        return;
-                    }
+                if title.starts_with("reka-frame-")
+                    && let Some(f) = state.frames.get_mut(proxy)
+                {
+                    f.name = Some(title);
+                    return;
                 }
 
                 state.send(ToEmacs::TitleChange(proxy.clone(), title.clone()));
 
-                log::warn!("received title for unknown window, orphan frame?");
+                if !state.windows.contains_key(proxy) {
+                    log::warn!("received title for unknown window, orphan frame?");
+                }
+            }
+            river::river_window_v1::Event::Parent { parent } => {
+                let mut notify = false;
+                if let Some(window) = state.windows.get_mut(proxy) {
+                    if window.parent != parent {
+                        if parent.is_none() && window.parent.is_some() {
+                            window.placement.detach_parent(window.hints.fixed());
+                        } else if window.placement.explicit.is_none() {
+                            // Only automatic dialogs adopt a new centering reference.
+                            window.placement.geometry = None;
+                        }
+                        window.parent = parent.clone();
+                        notify = window.announced;
+                    }
+                    window.placement.automatic = window.parent.is_some() || window.hints.fixed();
+                }
+                if notify {
+                    state.send(ToEmacs::ParentChanged(proxy.clone(), parent));
+                }
+            }
+            river::river_window_v1::Event::DimensionsHint {
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } => {
+                if let Some(window) = state.windows.get_mut(proxy) {
+                    window.hints = SizeHints {
+                        min_w: min_width,
+                        min_h: min_height,
+                        max_w: max_width,
+                        max_h: max_height,
+                    };
+                    window.placement.automatic = window.parent.is_some() || window.hints.fixed();
+                }
+            }
+            river::river_window_v1::Event::PointerMoveRequested { seat } => {
+                state.begin_pointer_operation(proxy, seat, PointerAction::Move);
+            }
+            river::river_window_v1::Event::PointerResizeRequested {
+                seat,
+                edges: wayland_client::WEnum::Value(edges),
+            } => {
+                let bits = edges.bits();
+                state.begin_pointer_operation(
+                    proxy,
+                    seat,
+                    PointerAction::Resize(ResizeEdges {
+                        top: bits & 1 != 0,
+                        bottom: bits & 2 != 0,
+                        left: bits & 4 != 0,
+                        right: bits & 8 != 0,
+                    }),
+                );
             }
             river::river_window_v1::Event::Dimensions { width, height } => {
                 if let Some(w) = state.windows.get_mut(proxy) {
@@ -1495,6 +2191,21 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
             river::river_window_v1::Event::Closed => {
                 state.send(ToEmacs::WindowClosed(proxy.clone()));
                 state.focus.invalidate(proxy);
+                if state.pointer_window.as_ref() == Some(proxy) {
+                    state.pointer_window = None;
+                }
+                let mut orphans = Vec::new();
+                for window in state.windows.values_mut() {
+                    if window.parent.as_ref() == Some(proxy) {
+                        window.parent = None;
+                        // Keep orphaned dialogs usable without moving or tiling them.
+                        window.placement.detach_parent(window.hints.fixed());
+                        orphans.push(window.proxy.clone());
+                    }
+                }
+                for orphan in orphans {
+                    state.send(ToEmacs::ParentChanged(orphan, None));
+                }
 
                 for output in state.outputs.values_mut() {
                     match &output.fullscreen {
@@ -1517,7 +2228,7 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                     log::warn!("unknown window closed; reka bug?");
                 }
             }
-            river::river_window_v1::Event::MinimizeRequested {} => {
+            river::river_window_v1::Event::MinimizeRequested => {
                 state.send(ToEmacs::MinimizeRequested(proxy.clone()));
             }
             river::river_window_v1::Event::FullscreenRequested { output: target } => {
@@ -1526,14 +2237,7 @@ impl Dispatch<RiverWindowV1, ()> for Reka {
                 // 2. the output the window is already on
                 // 3. the active output
                 let potential_target = target
-                    .or_else(|| {
-                        state
-                            .windows
-                            .get(proxy)
-                            .and_then(|w| w.params.as_ref())
-                            .and_then(|p| state.frame_by_name(&p.frame_name))
-                            .and_then(|f| f.displayed_on.clone())
-                    })
+                    .or_else(|| state.display_placement(proxy).map(|display| display.output))
                     .or_else(|| {
                         state
                             .focus
@@ -1604,6 +2308,16 @@ impl Dispatch<RiverXkbBindingV1, ()> for Reka {
                     state.send(ToEmacs::KeyEvent(event.clone()));
                     state.focus.switch_to_frame();
                 }
+                Command::ToggleFloating => {
+                    let target = state
+                        .focus
+                        .current_focus_and_frame()
+                        .filter(|(window, frame)| window != frame)
+                        .map(|(window, _)| window.clone());
+                    if let Some(target) = target {
+                        state.floating_command(&target, FloatingCommand::Toggle);
+                    }
+                }
                 Command::ToggleFullscreen => {
                     let Some((focus, frame)) = state.focus.current_focus_and_frame() else {
                         log::warn!("fullscreen requested, but nothing is focused. reka bug?");
@@ -1638,6 +2352,31 @@ impl Dispatch<RiverXkbBindingV1, ()> for Reka {
 
                     state.outputs.get_mut(output).unwrap().fullscreen = new_state;
                 }
+            }
+        }
+    }
+}
+
+impl Dispatch<river::river_pointer_binding_v1::RiverPointerBindingV1, ()> for Reka {
+    fn event(
+        state: &mut Self,
+        proxy: &river::river_pointer_binding_v1::RiverPointerBindingV1,
+        event: <river::river_pointer_binding_v1::RiverPointerBindingV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let river::river_pointer_binding_v1::Event::Pressed = event {
+            let action = state
+                .pointer_bindings
+                .iter()
+                .find(|binding| binding.proxy == *proxy)
+                .map(|binding| binding.action);
+            if let (Some(action), Some(window), Some(seat)) =
+                (action, state.pointer_window.clone(), state.seat.as_ref())
+            {
+                let seat = seat.proxy.clone();
+                state.begin_pointer_operation(&window, seat, action);
             }
         }
     }
