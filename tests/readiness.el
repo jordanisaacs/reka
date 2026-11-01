@@ -1,0 +1,31 @@
+;;; -*- lexical-binding: t -*-
+;;; SPDX-License-Identifier: GPL-3.0-or-later
+
+(require 'ert)
+(require 'reka)
+
+(ert-deftest reka-ready-event-runs-hook-once-after-setting-public-state ()
+  (let ((reka-ready nil)
+        (reka-handle 'test-handle)
+        (reka-processing-commands (make-mutex "reka-ready-test"))
+        (pending '(ready ready))
+        (calls 0)
+        (observed-ready nil)
+        (reka-ready-hook nil))
+    (add-hook 'reka-ready-hook
+              (lambda ()
+                (setq observed-ready reka-ready)
+                (cl-incf calls)))
+    (cl-letf (((symbol-function 'reka-get-next-command) (lambda (_) (pop pending)))
+              ((symbol-function 'reka-update-window-parameters) #'ignore)
+              ((symbol-function 'reka--all-window-parameters) (lambda () []))
+              ((symbol-function 'reka--refresh-floating-keymap) #'ignore)
+              ((symbol-function 'run-at-time) #'ignore))
+      (should-not reka-ready)
+      (should (zerop calls))
+      (reka--handle-commands)
+      (should observed-ready)
+      (should reka-ready)
+      (should (= calls 1))
+      (reka--handle-commands)
+      (should (= calls 1)))))

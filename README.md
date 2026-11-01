@@ -83,6 +83,13 @@ area), and `reka-floating-frame-name` variables. The
 Ordinary Emacs window/buffer selection clears native floating focus; explicitly
 selecting a floating application's buffer brings it to that frame and tab.
 
+For asynchronous session startup, add your finalization function to
+`reka-ready-hook` before calling `reka-enable`. The hook runs once, with
+`reka-ready` set to non-nil, after River has processed the first rendered Emacs
+frame on a usable output with input and key bindings available. The synchronous
+`reka-enable-hook` only indicates that native startup has been launched; it is
+too early to declare the desktop ready to a session manager.
+
 ## Using this
 
 You should be a sufficiently committed person to use this. There is no

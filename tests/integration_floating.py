@@ -66,6 +66,10 @@ class Session:
             f"(add-to-list 'load-path {json.dumps(str(module.parent))})\n"
             f"(add-to-list 'load-path {json.dumps(str(lisp_dir))})\n"
             "(require 'reka)\n(require 'reka-simulation)\n(require 'json)\n"
+            "(defvar reka-it-ready-count 0)\n"
+            "(defvar reka-it-ready-at-enable nil)\n"
+            "(add-hook 'reka-ready-hook (lambda () (cl-incf reka-it-ready-count)))\n"
+            "(add-hook 'reka-enable-hook (lambda () (setq reka-it-ready-at-enable reka-ready)))\n"
             '(setq tab-bar-new-tab-choice "*reka-empty-tab*")\n'
             '(get-buffer-create "*reka-empty-tab*")\n'
             "(reka-enable)\n"
@@ -75,7 +79,10 @@ class Session:
             "(when-let* ((b (seq-find (lambda (b) (not (rassq b reka-it-roles))) (reka--list-buffers)))) "
             "(push (cons role b) reka-it-roles) b)))\n"
             "(defun reka-it-state () (json-serialize "
-            "`((buffers . ,(vconcat (mapcar (lambda (b) (with-current-buffer b "
+            "`((ready . ,(if reka-ready t :false)) "
+            "(ready-count . ,reka-it-ready-count) "
+            "(ready-at-enable . ,(if reka-it-ready-at-enable t :false)) "
+            "(buffers . ,(vconcat (mapcar (lambda (b) (with-current-buffer b "
             "`((name . ,(buffer-name)) (app-id . ,reka-app-id) (role . ,(car (rassq b reka-it-roles))) (floating . ,(if reka-floating t :false)) "
             "(geometry . ,(vconcat reka-floating-geometry))))) (reka--list-buffers)))) "
             "(windows . ,(vconcat (mapcar (lambda (w) "
@@ -266,6 +273,12 @@ def main():
     try:
         session = Session(root)
         session.start(module, arguments.lisp_dir.resolve())
+        wait_until(lambda: session.state()["ready"], "native usable-frame readiness")
+        ready = session.state()
+        assert ready["ready-count"] == 1 and ready["ready-at-enable"] is False, ready
+        print(
+            "PASS: native readiness follows the first usable frame, after reka-enable"
+        )
         parent = session.launch(["reka-gtk-fixture", "parent"], "parent")
         session.wait_role("parent", False)
         session.evaluate(
@@ -481,6 +494,7 @@ def main():
             closed["parent"] is None and closed["dialog"] is None and closed["second"]
         ), closed
         assert session.role("second") and session.river.poll() is None
+        assert session.state()["ready-count"] == 1, session.state()
         command(second, "quit")
         print(
             "PASS: tabs hide/show real surfaces; closing the parent destroys its transient without damaging another app"

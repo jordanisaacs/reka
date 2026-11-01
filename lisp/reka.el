@@ -18,6 +18,16 @@
   "Hook run at the end of `reka-enable'."
   :type 'hook)
 
+(defvar reka-ready nil
+  "Non-nil after River has processed the first usable desktop frame.
+Unlike `reka-enable-hook', this indicates asynchronous native startup completed.")
+
+(defcustom reka-ready-hook nil
+  "Hook run once after River processes the first usable desktop frame.
+Session managers can finalize startup here.  The hook runs in Emacs after its
+native window manager has a displayed frame, input seat and key bindings."
+  :type 'hook)
+
 (defun reka--set-frame-name (frame)
   (unless (string-prefix-p "reka-frame-"
                            (frame-parameter frame 'name))
@@ -110,6 +120,11 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
     (setq reka--last-focused nil)
     (while-let ((cmd (reka-get-next-command reka-handle)))
       (pcase cmd
+        ('ready
+         (unless reka-ready
+           (setq reka-ready t)
+           (run-hooks 'reka-ready-hook)))
+
         (`(key-event . ,key)
          (push (cons t key) unread-command-events))
 
@@ -607,6 +622,7 @@ tabs, for example, is completely valid."
 (defun reka-enable ()
   "Enable the reka window manager for river. Call this function once when
 starting Emacs inside of river."
+  (setq reka-ready nil)
   ;; TODO: this is a hack for lack of ability to figure out alignment ...
   (menu-bar-mode 0)
   (tool-bar-mode 0)

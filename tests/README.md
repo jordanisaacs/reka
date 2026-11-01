@@ -27,6 +27,9 @@ dialog and native min/max size hints. Its small fixture clients request normal
 xdg-toplevel operations; they cannot change Reka's internal state. Screenshot
 pixel regions verify that the actual surfaces are visible/hidden, alongside
 the native geometry delivered to Lisp and the client's configured dimensions.
+It first checks that the native ready hook follows asynchronous frame startup,
+rather than running during `reka-enable`, and fires only once across later
+window and tab changes.
 
 It checks automatic dialog floating without parent retiling or a reserved empty
 tile; native Super+f tile/float/tile transitions, retained keyboard focus and

@@ -12,7 +12,10 @@ use anyhow::{Context, anyhow, bail};
 use emacs::{Env, FromLisp, IntoLisp, Result, Value, Vector, defun, use_symbols};
 use nix::poll::PollTimeout;
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use wayland_client::{Connection, Dispatch, protocol::wl_registry};
+use wayland_client::{
+    Connection, Dispatch,
+    protocol::{wl_callback, wl_registry},
+};
 use xkbcommon::xkb;
 
 mod floating;
@@ -83,6 +86,7 @@ use_symbols!(
     frame_parameter
     frame_name_parameter => "name"
     message
+    ready
     reka_get_window => "reka--get-window"
     reka_create_buffer => "reka--create-buffer"
     reka_list_buffers => "reka--list-buffers"
@@ -189,6 +193,7 @@ enum FromEmacs {
 
 #[derive(Debug)]
 enum ToEmacs {
+    Ready,
     KeyEvent(KeyEvent),
     NewWindow(RiverWindowV1, bool, Option<RiverWindowV1>),
     WindowClosed(RiverWindowV1),
@@ -207,6 +212,7 @@ enum ToEmacs {
 impl<'e> IntoLisp<'e> for ToEmacs {
     fn into_lisp(self, env: &'e Env) -> Result<Value<'e>> {
         match self {
+            ToEmacs::Ready => ready.into_lisp(env),
             ToEmacs::KeyEvent(event) => env.cons(key_event, event),
             ToEmacs::NewWindow(win, floating, parent) => {
                 let parent = match parent {
@@ -649,6 +655,7 @@ fn wm_loop(
         pointer_position: None,
         pointer_operation: None,
         pointer_bindings: Vec::new(),
+        readiness: Readiness::Waiting,
     };
     let _registry = display.get_registry(&qh, ());
 
@@ -925,6 +932,14 @@ impl Focus {
     }
 }
 
+#[derive(Default, PartialEq)]
+enum Readiness {
+    #[default]
+    Waiting,
+    Pending,
+    Ready,
+}
+
 struct Reka {
     pid: i32,
 
@@ -954,6 +969,7 @@ struct Reka {
     pointer_position: Option<(i32, i32)>,
     pointer_operation: Option<PointerOperation>,
     pointer_bindings: Vec<PointerBinding>,
+    readiness: Readiness,
 }
 
 impl Drop for Reka {
@@ -982,6 +998,18 @@ impl Drop for Reka {
 }
 
 impl Reka {
+    fn has_usable_frame(&self) -> bool {
+        self.seat.is_some()
+            && self.xkb_bindings.is_some()
+            && self.frames.values().any(|frame| {
+                frame
+                    .displayed_on
+                    .as_ref()
+                    .and_then(|output| self.outputs.get(output))
+                    .is_some_and(|output| output.width > 0 && output.height > 0)
+            })
+    }
+
     fn send(&mut self, cmd: ToEmacs) {
         if let Err(err) = self.tx.send(cmd) {
             log::error!("could not send message to Emacs: {}", err);
@@ -1831,13 +1859,35 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Reka {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, ()> for Reka {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event
+            && state.readiness == Readiness::Pending
+        {
+            if state.has_usable_frame() {
+                state.readiness = Readiness::Ready;
+                state.send(ToEmacs::Ready);
+            } else {
+                state.readiness = Readiness::Waiting;
+            }
+        }
+    }
+}
+
 impl Dispatch<RiverWindowManagerV1, ()> for Reka {
     fn event(
         state: &mut Self,
         proxy: &RiverWindowManagerV1,
         event: <RiverWindowManagerV1 as wayland_client::Proxy>::Event,
         _data: &(),
-        _conn: &Connection,
+        conn: &Connection,
         qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
@@ -1882,6 +1932,13 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
                 state.render_windows();
 
                 proxy.render_finish();
+
+                if state.readiness == Readiness::Waiting && state.has_usable_frame() {
+                    state.readiness = Readiness::Pending;
+                    // Wait until River has processed the render requests before
+                    // telling the session manager that the desktop is usable.
+                    conn.display().sync(qhandle, ());
+                }
             }
 
             river::river_window_manager_v1::Event::Output { id } => {
