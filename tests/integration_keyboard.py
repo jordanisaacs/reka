@@ -169,6 +169,13 @@ def main():
         # Every synthetic press must be followed by its release.
         events = re.findall(r"key: (\d+); state: (\d+)", first_output)
         assert len(events) == 12, first_output
+        timestamps = [
+            int(value) for value in re.findall(r"time: (\d+); key:", first_output)
+        ]
+        now = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        assert timestamps and all(
+            (now - stamp) & 0xFFFFFFFF < 10_000 for stamp in timestamps
+        ), timestamps
         assert all(
             events[index][0] == events[index + 1][0]
             and events[index][1] == "1"

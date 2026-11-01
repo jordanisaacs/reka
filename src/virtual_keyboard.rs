@@ -12,11 +12,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use nix::fcntl::{FcntlArg, SealFlag, fcntl};
 use nix::sys::memfd::{MFdFlags, memfd_create};
+use nix::time::{ClockId, clock_gettime};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     protocol::{wl_registry, wl_seat},
@@ -198,7 +198,6 @@ pub(crate) struct VirtualKeyboard {
     pending: VecDeque<Request>,
     ready: Arc<AtomicBool>,
     locked: bool,
-    clock: Instant,
 }
 
 impl VirtualKeyboard {
@@ -212,7 +211,6 @@ impl VirtualKeyboard {
             pending: VecDeque::new(),
             ready,
             locked: false,
-            clock: Instant::now(),
         }
     }
 
@@ -359,9 +357,12 @@ impl VirtualKeyboard {
             .as_ref()
             .context("simulation seat was removed")?;
         let file = batch.keymap_file()?;
+        // Match physical input's CLOCK_MONOTONIC base so client event times
+        // remain comparable when switching between real and simulated keys.
+        let now = clock_gettime(ClockId::CLOCK_MONOTONIC)?;
+        let time = (now.tv_sec() as u64 * 1000 + now.tv_nsec() as u64 / 1_000_000) as u32;
         keyboard.keymap(1, file.as_fd(), (batch.keymap.len() + 1).try_into()?);
         for stroke in batch.strokes {
-            let time = self.clock.elapsed().as_millis() as u32;
             keyboard.modifiers(stroke.modifiers, 0, 0, 0);
             keyboard.key(time, stroke.keycode, 1);
             keyboard.key(time, stroke.keycode, 0);
