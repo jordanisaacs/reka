@@ -78,6 +78,9 @@ Emacs selections, including notifications caused by detaching a tiled slot.")
 Matches the corresponding ext-foreign-toplevel-list identifier; unlike an
 application title or PID, it distinguishes windows across manager handoffs.")
 
+(defvar-local reka-title nil
+  "The application's original window title, without buffer-name decoration.")
+
 (defvar-local reka-floating-geometry nil
   "Last native window geometry as (X Y WIDTH HEIGHT), in logical pixels.
 Coordinates are relative to the usable area of `reka-floating-frame-name'.")
@@ -195,6 +198,7 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
         (`(title-change ,window ,title)
          (when-let* ((buf (reka--find-buffer-for-window window)))
            (with-current-buffer buf
+             (setq reka-title title)
              (rename-buffer (reka--make-buffer-name reka-app-id title) t))))
 
         ('frame-request (make-frame))
