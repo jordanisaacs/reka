@@ -186,7 +186,7 @@ enum FromEmacs {
     FocusFrame(String),
     CloseWindow(RiverWindowV1),
     BufferCreated(RiverWindowV1),
-    UpdateParameters(HashMap<RiverWindowV1, WindowParameters>),
+    UpdateParameters(Vec<WindowParameters>),
     Floating(RiverWindowV1, FloatingCommand),
     FloatingDefaultSize(i32, i32),
 }
@@ -510,13 +510,13 @@ fn update_window_parameters<'e>(
     handle: &Handle,
     per_frame: Vector<'e>,
 ) -> Result<Value<'e>> {
-    let mut new_params = HashMap::new();
+    let mut new_params = Vec::new();
     for elem in per_frame.into_iter() {
         let params: Vector<'e> = elem.into_rust()?;
         for p in params.into_iter() {
             let wp: &RefCell<WindowParameters> = p.into_rust()?;
             let params = wp.borrow().clone();
-            new_params.insert(params.window.clone(), params);
+            new_params.push(params);
         }
     }
 
@@ -1623,7 +1623,7 @@ impl Reka {
         }
     }
 
-    // reconcile_windows closes killed windows and removes them from the list
+    // reconcile_windows requests closure and configures live windows
     fn reconcile_windows(&mut self) {
         // Closing is a request, not a lifecycle transition: a client may ask
         // to save its work or decline. Keep its layout and focus usable, and
@@ -1796,7 +1796,28 @@ impl Reka {
                 FromEmacs::FloatingDefaultSize(width, height) => {
                     self.float_size = (width, height);
                 }
-                FromEmacs::UpdateParameters(mut new_params) => {
+                FromEmacs::UpdateParameters(candidates) => {
+                    // Emacs may keep a buffer in several frames, including a
+                    // spare frame not currently assigned to an output. Resolve
+                    // duplicates here, where native output ownership is known;
+                    // an inactive frame must not hide a real displayed tile.
+                    let mut new_params: HashMap<RiverWindowV1, WindowParameters> = HashMap::new();
+                    for candidate in candidates {
+                        let displayed = |params: &WindowParameters| {
+                            self.frame_by_name(&params.frame_name)
+                                .is_some_and(|frame| frame.displayed_on.is_some())
+                        };
+                        match new_params.entry(candidate.window.clone()) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(candidate);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if displayed(&candidate) && !displayed(entry.get()) {
+                                    entry.insert(candidate);
+                                }
+                            }
+                        }
+                    }
                     for (proxy, w) in self.windows.iter_mut() {
                         let result = new_params.remove(proxy);
                         if w.params != result {
