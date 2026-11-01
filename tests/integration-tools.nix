@@ -31,6 +31,7 @@ pkgs.symlinkJoin {
     (import ../nix/patched-river.nix { inherit (pkgs) river; })
     pkgs.emacs-pgtk
     pkgs.wtype
+    pkgs.wev
     pkgs.grim
     pkgs.coreutils
     (pkgs.python3.withPackages (ps: [ ps.pillow ]))
