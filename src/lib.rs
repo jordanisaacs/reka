@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::{Context, anyhow, bail};
@@ -25,6 +26,8 @@ use crate::river::{
     river_xkb_binding_v1::RiverXkbBindingV1,
     river_xkb_bindings_v1::RiverXkbBindingsV1,
 };
+
+mod virtual_keyboard;
 
 mod river {
     pub extern crate wayland_client;
@@ -151,6 +154,7 @@ fn command_from_lisp<'e>(command: Value<'e>, event: KeyEvent) -> Result<Command>
 #[derive(Debug)]
 enum FromEmacs {
     RegisterPrefix(XKBPrefix, Command),
+    SimulateKeys(virtual_keyboard::Request),
     FocusWindow(RiverWindowV1),
     FocusFrame,
     CloseWindow(RiverWindowV1),
@@ -197,6 +201,7 @@ struct Handle {
     fd: Arc<EventFd>,
     tx: Sender<FromEmacs>,
     rx: Receiver<ToEmacs>,
+    virtual_keyboard_ready: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -217,6 +222,58 @@ fn close_window<'e>(env: &'e Env, handle: &Handle, window: &RiverWindowV1) -> Re
     ().into_lisp(env)
 }
 
+/// Whether race-free simulation is available for the active, unlocked seat.
+/// Older compositors without river-virtual-keyboard-v1 remain supported.
+#[defun]
+fn virtual_keyboard_available_p(handle: &Handle) -> Result<bool> {
+    Ok(handle.virtual_keyboard_ready.load(Ordering::Acquire))
+}
+
+/// Send a bounded vector of [KEY MODIFIERS] strokes to an explicit managed
+/// WINDOW. KEY is a Unicode character or XKB keysym name; modifiers use River's
+/// bit masks. Public Lisp callers should use `reka-send-keys` instead.
+#[defun]
+fn inject_key_sequence<'e>(
+    env: &'e Env,
+    handle: &Handle,
+    window: &RiverWindowV1,
+    events: Vector<'e>,
+) -> Result<Value<'e>> {
+    if !handle.virtual_keyboard_ready.load(Ordering::Acquire) {
+        bail!(
+            "keyboard simulation unavailable: requires River 0.5, an active seat and an unlocked session"
+        );
+    }
+    if events.len() == 0 || events.len() > virtual_keyboard::MAX_STROKES {
+        bail!("simulation requires between 1 and 64 keys");
+    }
+    let mut strokes = Vec::with_capacity(events.len());
+    for event in events {
+        let stroke: Vector<'e> = event.into_rust()?;
+        if stroke.len() != 2 {
+            bail!("each simulated key requires a keysym and modifier bits");
+        }
+        let key: Value<'e> = stroke.get(0)?;
+        let keysym = if let Ok(character) = key.into_rust::<u32>() {
+            xkb::utf32_to_keysym(character)
+        } else {
+            let name: String = key.into_rust()?;
+            xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE)
+        };
+        let modifiers: u32 = stroke.get(1)?;
+        strokes.push(virtual_keyboard::Stroke {
+            keysym: keysym.into(),
+            modifiers,
+        });
+    }
+    let batch = virtual_keyboard::Batch::prepare(&strokes)?;
+    handle.send(FromEmacs::SimulateKeys(virtual_keyboard::Request {
+        target: window.clone(),
+        batch,
+    }))?;
+    ().into_lisp(env)
+}
+
 type EmacsChannel = Box<dyn std::io::Write>;
 
 /// Start the reka window manager process. This should not be called manually,
@@ -228,11 +285,13 @@ fn start_wm(env: &Env, pipe: Value<'_>) -> Result<Handle> {
     let (tx, rx) = channel::<FromEmacs>();
     let (tx_e, rx_e) = channel::<ToEmacs>();
 
+    let virtual_keyboard_ready = Arc::new(AtomicBool::new(false));
+    let ready_for_wm = virtual_keyboard_ready.clone();
     let emacs_fd = Arc::new(EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK)?);
     let emacs_fd_wmside = emacs_fd.clone();
 
     std::thread::spawn(move || {
-        let result = wm_loop(rx, tx_e, channel_file, emacs_fd_wmside);
+        let result = wm_loop(rx, tx_e, channel_file, emacs_fd_wmside, ready_for_wm);
         if let Err(e) = result {
             log::error!("reka window manager thread crashed: {:?}", e);
         }
@@ -243,6 +302,7 @@ fn start_wm(env: &Env, pipe: Value<'_>) -> Result<Handle> {
         fd: emacs_fd,
         tx,
         rx: rx_e,
+        virtual_keyboard_ready,
     })
 }
 
@@ -397,6 +457,7 @@ fn wm_loop(
     tx: Sender<ToEmacs>,
     to_emacs: EmacsChannel,
     emacs_fd: Arc<EventFd>,
+    keyboard_ready: Arc<AtomicBool>,
 ) -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
@@ -428,6 +489,7 @@ fn wm_loop(
         layer_shell: None,
         prefixes: Default::default(),
         pending_frames: 0,
+        virtual_keyboard: virtual_keyboard::VirtualKeyboard::new(keyboard_ready),
     };
     let _registry = display.get_registry(&qh, ());
 
@@ -673,6 +735,7 @@ struct Reka {
     river_wm: Option<RiverWindowManagerV1>,
     xkb_bindings: Option<RiverXkbBindingsV1>,
     layer_shell: Option<RiverLayerShellV1>,
+    virtual_keyboard: virtual_keyboard::VirtualKeyboard,
 
     seat: Option<Seat>,
     focus: Focus,
@@ -686,6 +749,7 @@ struct Reka {
 impl Drop for Reka {
     fn drop(&mut self) {
         // Destroy everything else before tearing down the WM objects.
+        self.virtual_keyboard.reset();
         self.prefixes.clear();
         self.windows.clear();
         self.frames.clear();
@@ -829,6 +893,34 @@ impl Reka {
         }
     }
 
+    // A manage sequence commits focus and one destination's keys atomically.
+    // Never combine destinations: River dispatches queued keys to final focus.
+    fn flush_virtual_keys(&mut self) {
+        let Some(request) = self.virtual_keyboard.next() else {
+            return;
+        };
+        let frame = self
+            .windows
+            .get(&request.target)
+            .filter(|window| window.state == WindowState::Active)
+            .and_then(|_| self.displaying_frame(&request.target))
+            .filter(|frame| frame.displayed_on.is_some())
+            .map(|frame| frame.proxy.clone());
+        let (Some(frame), Some(seat)) = (frame, self.seat.as_ref()) else {
+            self.send(ToEmacs::Message(
+                "keyboard simulation canceled: destination is no longer displayed".into(),
+            ));
+            return;
+        };
+        self.focus.focus_window(request.target.clone(), frame);
+        seat.proxy.focus_window(&request.target);
+        if let Err(error) = self.virtual_keyboard.emit(request.batch) {
+            self.send(ToEmacs::Message(format!(
+                "keyboard simulation failed: {error}"
+            )));
+        }
+    }
+
     // reconcile_windows closes killed windows and removes them from the list
     fn reconcile_windows(&mut self) {
         for (proxy, w) in self.windows.iter() {
@@ -901,6 +993,13 @@ impl Reka {
         while let Ok(msg) = self.rx.try_recv() {
             log::debug!("message from emacs: {:?}", msg);
             match msg {
+                FromEmacs::SimulateKeys(request) => {
+                    if let Err(error) = self.virtual_keyboard.enqueue(request) {
+                        self.send(ToEmacs::Message(error.to_string()));
+                    } else {
+                        needs_manage = true;
+                    }
+                }
                 FromEmacs::RegisterPrefix(prefix, command) => {
                     needs_manage = true;
                     log::debug!("registering new prefix with command {:?}", command);
@@ -999,10 +1098,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Reka {
         _conn: &Connection,
         qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::GlobalRemove { name } = event {
+            state.virtual_keyboard.global_removed(name);
+            return;
+        }
         if let wl_registry::Event::Global {
-            name, interface, ..
+            name,
+            interface,
+            version,
         } = event
         {
+            state
+                .virtual_keyboard
+                .global(proxy, name, &interface, version, qhandle);
             if interface == "river_window_manager_v1" {
                 let wm = proxy.bind::<RiverWindowManagerV1, _, _>(name, 4, qhandle, ());
                 state.river_wm = Some(wm);
@@ -1040,8 +1148,12 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
                 state.reconcile_bindings();
                 state.reconcile_fullscreen();
                 state.reconcile_focus();
+                state.flush_virtual_keys();
 
                 proxy.manage_finish();
+                if state.virtual_keyboard.has_pending() {
+                    proxy.manage_dirty();
+                }
             }
 
             // render sequence: positions, z-order, borders, visibility (?), clipping
@@ -1136,15 +1248,19 @@ impl Dispatch<RiverWindowManagerV1, ()> for Reka {
             }
 
             river::river_window_manager_v1::Event::Unavailable => {
+                state.virtual_keyboard.reset();
                 log::info!("RiverWindowManagerV1::Event::Unavailable received");
             }
             river::river_window_manager_v1::Event::Finished => {
+                state.virtual_keyboard.reset();
                 log::info!("RiverWindowManagerV1::Event::Finished received");
             }
             river::river_window_manager_v1::Event::SessionLocked => {
+                state.virtual_keyboard.lock(true);
                 log::info!("RiverWindowManagerV1::Event::SessionLocked received");
             }
             river::river_window_manager_v1::Event::SessionUnlocked => {
+                state.virtual_keyboard.lock(false);
                 log::info!("RiverWindowManagerV1::Event::SessionUnlocked received");
                 // TODO: do we still need to recover focus here?
             }
@@ -1254,10 +1370,30 @@ impl Dispatch<river::river_seat_v1::RiverSeatV1, ()> for Reka {
         event: <river::river_seat_v1::RiverSeatV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
+        qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         log::debug!("RiverSeatV1 event received: {:?}", event);
 
+        match &event {
+            river::river_seat_v1::Event::WlSeat { name }
+                if state
+                    .seat
+                    .as_ref()
+                    .is_some_and(|seat| seat.proxy == *_proxy) =>
+            {
+                state.virtual_keyboard.set_seat(*name, qhandle);
+            }
+            river::river_seat_v1::Event::Removed
+                if state
+                    .seat
+                    .as_ref()
+                    .is_some_and(|seat| seat.proxy == *_proxy) =>
+            {
+                state.virtual_keyboard.remove_seat();
+                state.seat.take();
+            }
+            _ => {}
+        }
         if let river::river_seat_v1::Event::WindowInteraction { window } = event {
             log::debug!("window interaction, setting focus: {:?}", window);
             if state.frames.contains_key(&window) {
