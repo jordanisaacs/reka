@@ -5,6 +5,7 @@ Use the tools from integration-tools.nix and pass the packaged libreka.so with
 """
 
 import argparse
+import base64
 import json
 import os
 import shlex
@@ -157,7 +158,13 @@ class Session:
         return result.stdout.strip()
 
     def state(self):
-        return json.loads(json.loads(self.evaluate("(reka-it-state)")))
+        # Lisp printer escapes for real multibyte app titles are not JSON.
+        encoded = json.loads(
+            self.evaluate(
+                "(base64-encode-string (encode-coding-string (reka-it-state) 'utf-8) t)"
+            )
+        )
+        return json.loads(base64.b64decode(encoded))
 
     def role(self, role):
         return next(

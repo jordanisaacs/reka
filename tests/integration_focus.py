@@ -57,9 +57,6 @@ def main():
                 assert active() == selected, "Hover must preserve keyboard focus"
                 session.point("button", button, 1)
                 session.point("button", button, 0)
-                wait_until(
-                    lambda: active() == role, f"clicked {role} selected in Emacs"
-                )
                 session.keys(character)
                 wait_until(
                     lambda: any(
@@ -69,6 +66,9 @@ def main():
                         for event in events(root, log)[before[log] :]
                     ),
                     f"physical keyboard input delivered to clicked {role}",
+                )
+                wait_until(
+                    lambda: active() == role, f"clicked {role} selected in Emacs"
                 )
                 received = events(root, log)[before[log] :]
                 assert (

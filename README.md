@@ -45,6 +45,10 @@ hidden until an output is available again, then reused. Native focus requests
 wait for the selected frame to be displayed, preserving its application focus
 across the interruption.
 
+Initial application buffers are announced only after a named output frame is
+usable. Native startup selects that frame in Lisp first, so PGTK's spare initial
+frame cannot collect applications that the compositor never displays.
+
 Clicking a tiled or floating application focuses it; moving the pointer over
 another window leaves keyboard focus unchanged. A click also selects the
 application's Emacs tile on the compositor's actual output, even when a spare

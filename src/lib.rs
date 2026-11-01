@@ -1003,16 +1003,25 @@ impl Drop for Reka {
 }
 
 impl Reka {
-    fn has_usable_frame(&self) -> bool {
-        self.seat.is_some()
-            && self.xkb_bindings.is_some()
-            && self.frames.values().any(|frame| {
-                frame
+    fn usable_frame_name(&self) -> Option<&str> {
+        let usable = |frame: &Frame| {
+            frame.name.is_some()
+                && frame
                     .displayed_on
                     .as_ref()
                     .and_then(|output| self.outputs.get(output))
                     .is_some_and(|output| output.width > 0 && output.height > 0)
-            })
+        };
+        self.focus
+            .current_focus_and_frame()
+            .and_then(|(_, frame)| self.frames.get(frame))
+            .filter(|frame| usable(frame))
+            .or_else(|| self.frames.values().find(|frame| usable(frame)))
+            .and_then(|frame| frame.name.as_deref())
+    }
+
+    fn has_usable_frame(&self) -> bool {
+        self.seat.is_some() && self.xkb_bindings.is_some() && self.usable_frame_name().is_some()
     }
 
     fn send(&mut self, cmd: ToEmacs) {
@@ -1025,6 +1034,13 @@ impl Reka {
     }
 
     fn announce_windows(&mut self) {
+        // PGTK may create its initial frame while River has already requested
+        // another one. Before first readiness, Lisp cannot know which frame
+        // actually owns the output; creating app buffers then can strand them
+        // in an undisplayed frame. Initial announcements follow FrameFocused.
+        if self.readiness != Readiness::Ready {
+            return;
+        }
         let mut announcements = Vec::new();
         for window in self.windows.values_mut() {
             if !window.announced {
@@ -1563,6 +1579,7 @@ impl Reka {
             };
 
             self.focus.focus_frame(frame);
+            self.focus.mark_dirty();
         }
 
         // A frame survives output removal, including while another VT is
@@ -1590,11 +1607,12 @@ impl Reka {
                 .expect("reka bug: inactive frame focused");
             self.outputs[output].ls_output.set_default();
 
-            // don't notify emacs about focused frames
-            if target != frame
-                && let Some(name) = self.frames[frame].name.clone()
-            {
-                self.send(ToEmacs::Focused(target.clone(), name));
+            if let Some(name) = self.frames[frame].name.clone() {
+                if target == frame {
+                    self.send(ToEmacs::FrameFocused(name));
+                } else {
+                    self.send(ToEmacs::Focused(target.clone(), name));
+                }
             }
         }
     }
@@ -1924,6 +1942,10 @@ impl Dispatch<wl_callback::WlCallback, ()> for Reka {
         {
             if state.has_usable_frame() {
                 state.readiness = Readiness::Ready;
+                if let Some(name) = state.usable_frame_name().map(str::to_owned) {
+                    state.send(ToEmacs::FrameFocused(name));
+                }
+                state.announce_windows();
                 state.send(ToEmacs::Ready);
             } else {
                 state.readiness = Readiness::Waiting;
