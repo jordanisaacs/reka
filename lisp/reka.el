@@ -502,7 +502,10 @@ Set to nil to register no default; `reka-floating-toggle' remains available."
         (progn
           (setq reka--focused-floating-buffer buffer)
           (reka--remember-floating-selection))
-      (display-buffer buffer))
+      ;; A newly launched application must receive keyboard focus as well as
+      ;; a tile.  `display-buffer' alone leaves the previous buffer selected.
+      (when-let* ((tile (display-buffer buffer)))
+        (select-window tile 'norecord)))
     (reka--refresh-floating-keymap)
     buffer))
 

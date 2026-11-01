@@ -49,6 +49,22 @@
          (mapcar (lambda (frame) (mapcar #'car (append frame nil)))
                  (append (reka--all-window-parameters) nil))))
 
+(ert-deftest reka-new-tiled-application-is-visible-and-selected ()
+  (reka-test--with-layout
+    (switch-to-buffer (get-buffer-create " *reka-launch-background*"))
+    (let ((application (reka--create-buffer 'application)))
+      (should (get-buffer-window application t))
+      (should (eq (window-buffer (selected-window)) application)))))
+
+(ert-deftest reka-new-tiled-application-selects-its-own-tile ()
+  (reka-test--with-layout
+    (let ((first (reka--create-buffer 'first)))
+      (switch-to-buffer first)
+      (let ((second (reka--create-buffer 'second)))
+        (should (get-buffer-window first t))
+        (should (get-buffer-window second t))
+        (should (eq (window-buffer (selected-window)) second))))))
+
 (ert-deftest reka-floating-dialog-does-not-retile-its-parent ()
   (reka-test--with-layout
     (let ((parent (reka--create-buffer 'parent)))
