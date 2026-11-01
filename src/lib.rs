@@ -2059,6 +2059,12 @@ impl Dispatch<river::river_seat_v1::RiverSeatV1, ()> for Reka {
     ) {
         log::debug!("RiverSeatV1 event received: {:?}", event);
 
+        // Reka selects one primary seat. Secondary seat events must not
+        // disturb that seat's focus, pointer operation or simulated keyboard.
+        if state.seat.as_ref().is_none_or(|seat| seat.proxy != *_proxy) {
+            return;
+        }
+
         match &event {
             river::river_seat_v1::Event::WlSeat { name }
                 if state
